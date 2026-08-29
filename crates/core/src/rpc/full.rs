@@ -2782,9 +2782,11 @@ mod tests {
     use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
     use test_case::test_case;
 
+    use surfpool_types::transaction_lifecycle::TransactionLifecycleState;
+
     use super::*;
     use crate::{
-        surfnet::{BlockHeader, BlockIdentifier, remote::SurfnetRemoteClient},
+        surfnet::{BlockHeader, BlockIdentifier, remote::SurfnetRemoteClient, svm::TransactionCommit},
         tests::helpers::TestSetup,
         types::{SurfnetTransactionStatus, SyntheticBlockhash, TransactionWithStatusMeta},
     };
@@ -2874,6 +2876,377 @@ mod tests {
         }
 
         handle
+    }
+
+    /// A runloop stand-in: confirms every dispatched transaction on
+    /// its status channel and forwards the request for assertions.
+    fn spawn_confirming_mempool() -> (
+        crossbeam_channel::Sender<SimnetCommand>,
+        Receiver<ProcessTransactionRequest>,
+    ) {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded::<SimnetCommand>();
+        let (seen_tx, seen_rx) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            while let Ok(cmd) = mempool_rx.recv() {
+                if let SimnetCommand::ProcessTransaction(request) = cmd {
+                    let _ = request.status_tx.send(TransactionStatusEvent::Success(
+                        TransactionConfirmationStatus::Confirmed,
+                    ));
+                    let _ = seen_tx.send(request);
+                }
+            }
+        });
+        (mempool_tx, seen_rx)
+    }
+
+    fn encode_versioned_transaction(tx: &VersionedTransaction) -> String {
+        bs58::encode(bincode::serialize(tx).unwrap()).into_string()
+    }
+
+    fn lifecycle_of(
+        setup: &TestSetup<SurfpoolFullRpc>,
+        signature: &solana_signature::Signature,
+    ) -> TransactionLifecycleState {
+        setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.transaction_lifecycle_state(signature))
+    }
+
+    /// A funded payer and a transfer signed against the current tip.
+    fn funded_transfer(
+        setup: &TestSetup<SurfpoolFullRpc>,
+        lamports: u64,
+    ) -> VersionedTransaction {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        setup
+            .context
+            .svm_locker
+            .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[transfer(&payer.pubkey(), &recipient, lamports)],
+            &recent_blockhash,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_admission_stores_received_and_chooses_the_validation_mode() {
+        let (mempool_tx, seen_rx) = spawn_confirming_mempool();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let tx = funded_transfer(&setup, 1_000_000);
+        let signature = tx.signatures[0];
+
+        let result = setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                encode_versioned_transaction(&tx),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, signature.to_string());
+        assert_eq!(
+            lifecycle_of(&setup, &signature),
+            TransactionLifecycleState::Admitted,
+            "admission records the in-flight transaction"
+        );
+        let request = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the transaction is dispatched to the runloop");
+        assert_eq!(
+            request.blockhash_validation,
+            TransactionBlockhashValidation::ValidatedAtAdmission
+        );
+        assert!(
+            request.skip_preflight,
+            "admission already simulated; execution must not repeat it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_resending_an_in_flight_transaction_is_idempotent() {
+        let (mempool_tx, seen_rx) = spawn_confirming_mempool();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let tx = funded_transfer(&setup, 1_000_000);
+        let signature = tx.signatures[0];
+        let encoded = encode_versioned_transaction(&tx);
+
+        let first = setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded.clone(), None)
+            .await
+            .unwrap();
+        seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the first submission is dispatched");
+
+        // Clients resend the same wire transaction in retry loops; a
+        // resend answers with the signature and dispatches nothing.
+        let second = setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded, None)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second, signature.to_string());
+        assert!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a resend must not dispatch a second execution"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_admission_rejects_a_stale_blockhash() {
+        let (mempool_tx, seen_rx) = spawn_confirming_mempool();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let payer = Keypair::new();
+        setup
+            .context
+            .svm_locker
+            .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        let stale = Hash::new_unique();
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1)],
+            &stale,
+        );
+        let signature = tx.signatures[0];
+
+        let error = setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                encode_versioned_transaction(&tx),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.message.contains("Blockhash not found"),
+            "unexpected admission answer: {}",
+            error.message
+        );
+        assert_eq!(lifecycle_of(&setup, &signature), TransactionLifecycleState::Unknown);
+        assert!(seen_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_admission_rejects_an_invalid_signature() {
+        let (mempool_tx, seen_rx) = spawn_confirming_mempool();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let payer = Keypair::new();
+        setup
+            .context
+            .svm_locker
+            .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let mut tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1)],
+            &recent_blockhash,
+        );
+        // Corrupt the signature so verification fails.
+        tx.signatures[0] = solana_signature::Signature::new_unique();
+
+        let error = setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                encode_versioned_transaction(&tx),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.message.contains("verification failed"),
+            "unexpected admission answer: {}",
+            error.message
+        );
+        assert!(seen_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_processed_duplicate_follows_the_preflight_choice() {
+        let (mempool_tx, seen_rx) = spawn_confirming_mempool();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let tx = funded_transfer(&setup, 1_000_000);
+        let signature = tx.signatures[0];
+        let encoded = encode_versioned_transaction(&tx);
+
+        // Seed the registry with an executed entry through the gate.
+        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.commit_processed_transaction(TransactionCommit {
+                meta: TransactionWithStatusMeta {
+                    slot: 1,
+                    transaction: tx.clone(),
+                    ..Default::default()
+                },
+                mutated_account_pubkeys: std::collections::HashSet::new(),
+                status_tx,
+                notified_slot: 1,
+            })
+        })
+        .unwrap();
+
+        // With preflight, the duplicate answers as agave's simulation
+        // would.
+        let error = setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("already been processed"),
+            "unexpected admission answer: {}",
+            error.message
+        );
+
+        // With skip_preflight, agave forwards and the bank drops the
+        // duplicate; answering with the signature and dispatching
+        // nothing is observably equivalent.
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+        let result = setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded, Some(config))
+            .await
+            .unwrap();
+        assert_eq!(result, signature.to_string());
+        assert!(seen_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_preflight_simulation_gates_admission() {
+        let (mempool_tx, seen_rx) = spawn_confirming_mempool();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        // An unfunded payer: the transfer simulates to a failure.
+        let payer = Keypair::new();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), LAMPORTS_PER_SOL)],
+            &recent_blockhash,
+        );
+        let encoded = encode_versioned_transaction(&tx);
+
+        let error = setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("Transaction simulation failed"),
+            "unexpected admission answer: {}",
+            error.message
+        );
+
+        // skip_preflight admits it; the failure is execution's to
+        // report.
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+        setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded, Some(config))
+            .await
+            .unwrap();
+        seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a skip_preflight submission is dispatched");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_nonce_transaction_validates_at_execution() {
+        let (mempool_tx, seen_rx) = spawn_confirming_mempool();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let payer = Keypair::new();
+        let nonce_account = Pubkey::new_unique();
+        let advance = system_instruction::advance_nonce_account(&nonce_account, &payer.pubkey());
+        let message = LegacyMessage::new_with_blockhash(
+            &[advance],
+            Some(&payer.pubkey()),
+            &Hash::new_unique(),
+        );
+        let mut tx = Transaction::new_unsigned(message);
+        tx.signatures[0] = solana_signature::Signature::new_unique();
+        let tx = VersionedTransaction {
+            signatures: tx.signatures,
+            message: VersionedMessage::Legacy(tx.message),
+        };
+        let signature = tx.signatures[0];
+
+        // Signature verification and preflight are skipped so the test
+        // isolates the recency decision: a nonce transaction's stale
+        // recent_blockhash must not reject it at admission.
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+            skip_sig_verify: Some(true),
+        };
+        setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                encode_versioned_transaction(&tx),
+                Some(config),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(lifecycle_of(&setup, &signature), TransactionLifecycleState::Admitted);
+        let request = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the nonce transaction is dispatched");
+        assert_eq!(
+            request.blockhash_validation,
+            TransactionBlockhashValidation::ValidateAtExecution
+        );
     }
 
     #[test_case(None, false ; "when limit is None")]
