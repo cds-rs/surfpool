@@ -359,7 +359,12 @@ pub mod tests {
     impl Drop for TestType {
         fn drop(&mut self) {
             if let TestType::OnDiskSqlite(db_path) = self {
-                // Delete file at db_path when TestType goes out of scope
+                // Delete file at db_path when TestType goes out of scope.
+                // Anything still running against this database must stop
+                // first: the pool opens connections by path, so a
+                // connection opened after this unlink lands on a fresh
+                // empty database with no tables. RunloopGuard holds its
+                // TestType for exactly this reason.
                 let _ = std::fs::remove_file(db_path);
             }
             // Note: PostgreSQL data is isolated by surfnet_id and doesn't need cleanup

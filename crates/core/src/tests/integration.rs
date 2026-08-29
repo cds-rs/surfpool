@@ -174,6 +174,14 @@ impl std::error::Error for RunloopError {}
 struct RunloopGuard {
     commands: Sender<SimnetCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The storage handle whose Drop deletes an on-disk database.
+    /// Held here, and declared last, so the deletion happens after
+    /// the runloop thread has stopped: dropping the TestType earlier
+    /// unlinks a live database out from under the connection pool,
+    /// and any connection the pool opens afterward lands on a fresh
+    /// empty file with no tables, killing the runloop on its next
+    /// storage query.
+    storage: Option<TestType>,
 }
 
 impl RunloopGuard {
@@ -269,6 +277,7 @@ fn spawn_runloop(
     Ok(RunloopGuard {
         commands: stop,
         thread: Some(thread),
+        storage: None,
     })
 }
 
@@ -4628,6 +4637,7 @@ fn a_panicking_runloop_is_not_a_clean_stop() {
     let guard = RunloopGuard {
         commands,
         thread: Some(std::thread::spawn(|| panic!("the runloop fell over"))),
+        storage: None,
     };
 
     assert!(
@@ -6047,12 +6057,15 @@ fn start_surfnet(
     let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
     let (simnet_commands_tx, simnet_commands_rx) = unbounded();
     let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
-    let runloop = spawn_runloop(
+    let mut runloop = spawn_runloop(
         svm_locker.clone(),
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
     )?;
+    // The guard owns the storage handle so its database outlives the
+    // runloop; see the field's rustdoc.
+    runloop.storage = Some(test_type);
 
     // An offline surfnet has no datasource to reach, so waiting for Connected
     // would wait out the deadline.
