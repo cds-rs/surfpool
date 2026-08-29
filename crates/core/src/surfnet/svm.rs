@@ -4428,6 +4428,34 @@ mod tests {
         }
     }
 
+    /// Characterization: the admitted window is subscribable. The 772
+    /// machinery installs the receiver under the SVM write lock, and
+    /// execution's processed notification lands on it.
+    #[test]
+    fn a_subscription_during_the_admitted_window_lands_at_execution() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        svm.admit_transaction(&signature).unwrap();
+
+        let rx = match svm
+            .get_local_signature_status_or_subscribe(
+                &signature,
+                SignatureSubscriptionType::processed(),
+            )
+            .unwrap()
+        {
+            LocalSignatureStatusOrSubscription::Subscription(rx) => rx,
+            LocalSignatureStatusOrSubscription::Status(_) => {
+                panic!("an admitted entry has no status yet")
+            }
+        };
+
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+        rx.try_recv()
+            .expect("execution notifies the admitted-window subscriber");
+    }
+
     #[test]
     fn admitting_a_transaction_stores_the_received_image() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();

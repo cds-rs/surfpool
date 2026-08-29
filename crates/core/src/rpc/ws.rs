@@ -1257,8 +1257,15 @@ impl Rpc for SurfpoolWsRpc {
                 };
 
             // Preserve the historical remote lookup for signatures that were not executed
-            // locally. Its result is intentionally not inserted into the SVM.
-            let tx_result = if local_tx_result.is_none() {
+            // locally. Its result is intentionally not inserted into the SVM. An admitted
+            // transaction is local and in flight, so the remote can know nothing about it
+            // and the lookup would only add an upstream round-trip of latency before the
+            // subscription lands.
+            let in_flight = svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader.transaction_lifecycle_state(&signature)
+                    == surfpool_types::transaction_lifecycle::TransactionLifecycleState::Admitted
+            });
+            let tx_result = if local_tx_result.is_none() && !in_flight {
                 match remote_ctx.as_ref() {
                     Some((remote_client, _)) => {
                         remote_client
