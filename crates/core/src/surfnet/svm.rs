@@ -1083,18 +1083,28 @@ impl SurfnetSvm {
         let blocks_db = storage_backend.open_store("blocks")?;
         let mut transactions_db: Box<dyn Storage<String, SurfnetTransactionStatus>> =
             storage_backend.open_store("transactions")?;
-        // A Received row from a previous process has no machine behind
-        // it: its command-queue entry died with that process. Sweep at
-        // open so the signature reads Unknown rather than as admitted
-        // forever.
-        let stale_admissions: Vec<String> = transactions_db
-            .into_iter()?
-            .filter_map(|(key, entry)| {
-                matches!(entry, SurfnetTransactionStatus::Received).then_some(key)
-            })
-            .collect();
-        for key in stale_admissions {
-            let _ = transactions_db.take(&key);
+        // A row from a previous process has no machine behind it: the
+        // command queue and the commitment ladder died with that
+        // process. Normalize at open: a Received row is swept (the
+        // signature reads Unknown rather than as admitted forever),
+        // and an executed row is promoted to Finalized, the answer a
+        // real node gives for old slots after a restart.
+        let stale_rows: Vec<(String, SurfnetTransactionStatus)> =
+            transactions_db.into_iter()?.collect();
+        for (key, entry) in stale_rows {
+            match entry {
+                SurfnetTransactionStatus::Received => {
+                    let _ = transactions_db.take(&key);
+                }
+                SurfnetTransactionStatus::Processed(payload)
+                | SurfnetTransactionStatus::Confirmed(payload) => {
+                    transactions_db.store(
+                        key,
+                        SurfnetTransactionStatus::Finalized(payload),
+                    )?;
+                }
+                SurfnetTransactionStatus::Finalized(_) => {}
+            }
         }
         let jito_bundles_db = storage_backend.open_store("jito_bundles")?;
         let token_accounts_db = storage_backend.open_store("token_accounts")?;

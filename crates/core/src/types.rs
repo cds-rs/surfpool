@@ -345,8 +345,13 @@ impl SurfnetTransactionStatus {
     pub fn wire_confirmation_status(
         &self,
     ) -> Option<solana_transaction_status::TransactionConfirmationStatus> {
-        let _ = self;
-        todo!()
+        use solana_transaction_status::TransactionConfirmationStatus as Wire;
+        match self {
+            SurfnetTransactionStatus::Received => None,
+            SurfnetTransactionStatus::Processed(_) => Some(Wire::Processed),
+            SurfnetTransactionStatus::Confirmed(_) => Some(Wire::Confirmed),
+            SurfnetTransactionStatus::Finalized(_) => Some(Wire::Finalized),
+        }
     }
 
     /// The stored image of an executed payload at the given lifecycle
