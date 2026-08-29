@@ -2377,7 +2377,7 @@ impl SurfnetSvm {
     /// `Err(SurfpoolError)` on error. The failure count powers the `stats`
     /// field of `SlotUpdate::Frozen` notifications emitted to
     /// `slotsUpdatesSubscribe` clients.
-    fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
+    pub(crate) fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
         let mut confirmed_transactions = vec![];
         let mut num_failed: u64 = 0;
         let slot = self.latest_epoch_info.slot_index;
@@ -2455,7 +2455,7 @@ impl SurfnetSvm {
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(SurfpoolError)` on error.
-    fn finalize_transactions(&mut self) -> Result<(), SurfpoolError> {
+    pub(crate) fn finalize_transactions(&mut self) -> Result<(), SurfpoolError> {
         let current_slot = self.latest_epoch_info.absolute_slot;
         let mut requeue = VecDeque::new();
         while let Some((finalized_at, tx, status_tx, error)) =
@@ -4513,6 +4513,49 @@ mod tests {
             svm.transaction_lifecycle_state(&signature),
             TransactionLifecycleState::Processed
         );
+    }
+
+    /// The projection reads the ladder, never the clock: a slot warp
+    /// without drains must not promote commitment, and the drains must.
+    #[test]
+    fn commitment_reads_the_ladder_not_the_clock() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+
+        // A warp: the clock jumps, the ladder does not.
+        svm.latest_epoch_info.absolute_slot += 1000;
+        match svm
+            .get_local_signature_status_or_subscribe(
+                &signature,
+                SignatureSubscriptionType::finalized(),
+            )
+            .unwrap()
+        {
+            LocalSignatureStatusOrSubscription::Subscription(_rx) => {}
+            LocalSignatureStatusOrSubscription::Status(_) => {
+                panic!("a warped clock must not promote commitment")
+            }
+        }
+
+        // The drains advance the ladder, and the same question then
+        // answers with a status.
+        svm.confirm_transactions().unwrap();
+        svm.latest_epoch_info.absolute_slot += FINALIZATION_SLOT_THRESHOLD;
+        svm.finalize_transactions().unwrap();
+        match svm
+            .get_local_signature_status_or_subscribe(
+                &signature,
+                SignatureSubscriptionType::finalized(),
+            )
+            .unwrap()
+        {
+            LocalSignatureStatusOrSubscription::Status(_) => {}
+            LocalSignatureStatusOrSubscription::Subscription(_rx) => {
+                panic!("a finalized ladder answers immediately")
+            }
+        }
     }
 
     #[test]

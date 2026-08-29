@@ -4590,6 +4590,63 @@ pub fn format_ui_amount(amount: u64, decimals: u8) -> Option<f64> {
 mod tests {
     use std::collections::HashMap;
 
+    /// The projection reads the ladder, never the clock: getTransaction's
+    /// confirmation status stays with the stored lifecycle across a slot
+    /// warp, and follows the drains when they run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transaction_status_reads_the_ladder_not_the_clock() {
+        let (svm_instance, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm_instance);
+        let signature = solana_signature::Signature::new_unique();
+
+        locker.with_svm_writer(|svm_writer| {
+            let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+            svm_writer.commit_processed_transaction(TransactionCommit {
+                meta: TransactionWithStatusMeta {
+                    slot: 1,
+                    transaction: solana_transaction::versioned::VersionedTransaction {
+                        signatures: vec![signature],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                mutated_account_pubkeys: std::collections::HashSet::new(),
+                status_tx,
+                notified_slot: 1,
+            })?;
+            svm_writer.latest_epoch_info.absolute_slot += 1000;
+            Ok::<(), SurfpoolError>(())
+        })
+        .unwrap();
+
+        let status = |locker: &SurfnetSvmLocker| {
+            let GetTransactionResult::FoundTransaction(_, _, status) = locker
+                .get_transaction_local(&signature, &RpcTransactionConfig::default())
+                .unwrap()
+            else {
+                panic!("the committed transaction is local");
+            };
+            status.confirmation_status.unwrap()
+        };
+        assert_eq!(
+            status(&locker),
+            solana_transaction_status::TransactionConfirmationStatus::Processed,
+            "a warped clock must not promote commitment"
+        );
+
+        locker.with_svm_writer(|svm_writer| {
+            svm_writer.confirm_transactions()?;
+            svm_writer.latest_epoch_info.absolute_slot += FINALIZATION_SLOT_THRESHOLD;
+            svm_writer.finalize_transactions()
+        })
+        .unwrap();
+        assert_eq!(
+            status(&locker),
+            solana_transaction_status::TransactionConfirmationStatus::Finalized,
+            "the drains are what advance the wire answer"
+        );
+    }
+
     use solana_account::Account;
     use solana_account_decoder::UiAccountEncoding;
     use solana_epoch_schedule::EpochSchedule;
@@ -4605,6 +4662,7 @@ mod tests {
     use crate::{
         rpc::full::RpcTransactionsForAddressFilters,
         scenarios::registry::PYTH_V2_IDL_CONTENT,
+        surfnet::svm::TransactionCommit,
         types::SurfnetTransactionStatus,
         surfnet::{
             BlockHeader, SurfnetSvm,
