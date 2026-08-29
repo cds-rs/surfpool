@@ -337,6 +337,18 @@ impl SurfnetTransactionStatus {
         Self::Processed(Box::new((status, updated_accounts)))
     }
 
+    /// The wire commitment of an executed entry, for
+    /// getSignatureStatuses and its siblings. An admitted entry has
+    /// none, matching a real node's in-flight null; the projection
+    /// reads the stored lifecycle the drains maintain, never slot
+    /// distance.
+    pub fn wire_confirmation_status(
+        &self,
+    ) -> Option<solana_transaction_status::TransactionConfirmationStatus> {
+        let _ = self;
+        todo!()
+    }
+
     /// The stored image of an executed payload at the given lifecycle
     /// state. Only the executed states have one; the commitment gate
     /// hands this function machine output, so any other state is a

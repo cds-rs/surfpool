@@ -4505,10 +4505,38 @@ mod tests {
         );
     }
 
-    /// A Received row that survives a process restart has no machine
-    /// behind it: its command-queue entry died with the process, so a
-    /// reopened database sweeps it, and the signature reads as Unknown
-    /// rather than as admitted forever.
+    #[test]
+    fn wire_commitment_reads_the_entry_variant() {
+        use solana_transaction_status::TransactionConfirmationStatus as W;
+        let payload = || (TransactionWithStatusMeta::default(), HashSet::new());
+        assert_eq!(
+            SurfnetTransactionStatus::Received.wire_confirmation_status(),
+            None,
+            "an admitted entry answers as a real node's in-flight null"
+        );
+        assert_eq!(
+            SurfnetTransactionStatus::executed_at(TransactionLifecycleState::Processed, payload())
+                .wire_confirmation_status(),
+            Some(W::Processed)
+        );
+        assert_eq!(
+            SurfnetTransactionStatus::executed_at(TransactionLifecycleState::Confirmed, payload())
+                .wire_confirmation_status(),
+            Some(W::Confirmed)
+        );
+        assert_eq!(
+            SurfnetTransactionStatus::executed_at(TransactionLifecycleState::Finalized, payload())
+                .wire_confirmation_status(),
+            Some(W::Finalized)
+        );
+    }
+
+    /// A row that survives a process restart has no machine behind it:
+    /// the command queue and the commitment ladder died with the
+    /// process. A reopened database sweeps admitted rows (the
+    /// signature reads Unknown rather than as admitted forever) and
+    /// promotes executed rows to Finalized, the answer a real node
+    /// gives for old slots after a restart.
     #[test]
     fn a_reopened_database_sweeps_stale_admissions() {
         let db_path = std::env::temp_dir().join(format!(
@@ -4518,12 +4546,16 @@ mod tests {
         let db_url = db_path.to_str().unwrap().to_string();
         let signature = Signature::new_unique();
         let executed = Signature::new_unique();
+        let confirmed = Signature::new_unique();
 
         {
             let (mut svm, _events_rx, _geyser_rx) =
                 SurfnetSvm::new_with_db(Some(&db_url), SurfnetSvmConfig::default()).unwrap();
             svm.admit_transaction(&signature).unwrap();
-            svm.commit_processed_transaction(lifecycle_test_commit(executed, 1))
+            svm.commit_processed_transaction(lifecycle_test_commit(confirmed, 1))
+                .unwrap();
+            svm.confirm_transactions().unwrap();
+            svm.commit_processed_transaction(lifecycle_test_commit(executed, 2))
                 .unwrap();
         }
 
@@ -4536,8 +4568,13 @@ mod tests {
         );
         assert_eq!(
             svm.transaction_lifecycle_state(&executed),
-            TransactionLifecycleState::Processed,
-            "executed entries survive the sweep"
+            TransactionLifecycleState::Finalized,
+            "a processed row from a dead process is promoted to Finalized"
+        );
+        assert_eq!(
+            svm.transaction_lifecycle_state(&confirmed),
+            TransactionLifecycleState::Finalized,
+            "a confirmed row from a dead process is promoted to Finalized"
         );
 
         drop(svm);
