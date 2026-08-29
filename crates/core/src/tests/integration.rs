@@ -338,11 +338,22 @@ fn wait_for_startup(
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test]
 async fn test_simnet_ready(test_type: TestType) {
+    // Ports per variant: the test_case variants run concurrently, and
+    // two runloops on the default ports means the second dies at bind
+    // time.
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
             block_production_mode: BlockProductionMode::Manual, // Prevent ticks
             ..SimnetConfig::default()
         }],
+        rpc: RpcConfig {
+            bind_host: "127.0.0.1".to_string(),
+            bind_port,
+            ws_port,
+            ..Default::default()
+        },
         ..SurfpoolConfig::default()
     };
 
