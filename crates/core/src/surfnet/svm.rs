@@ -63,6 +63,7 @@ use surfpool_types::{
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
+    transaction_lifecycle::TransactionLifecycleState,
     types::{
         ComputeUnitsEstimationResult, KeyedProfileResult, UiKeyedProfileResult, UuidOrSignature,
     },
@@ -502,6 +503,20 @@ fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBloc
     SyntheticBlockhash::new(u64::MAX - (genesis_slot - slot - 1))
 }
 
+/// One executed transaction ready to enter the registry: the stored
+/// meta (whose embedded transaction also feeds the confirmation
+/// queue), the accounts it mutated, the per-submission status channel
+/// the confirmation queue will own, and the slot the subscriber
+/// notifications quote. The error and logs the notifications carry
+/// are read from the meta itself, so the projection cannot disagree
+/// with the stored entry.
+pub struct TransactionCommit {
+    pub meta: TransactionWithStatusMeta,
+    pub mutated_account_pubkeys: HashSet<Pubkey>,
+    pub status_tx: Sender<TransactionStatusEvent>,
+    pub notified_slot: Slot,
+}
+
 impl SurfnetSvm {
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
         Self::new(SurfnetSvmConfig::default()).unwrap()
@@ -850,6 +865,25 @@ impl SurfnetSvm {
         }
 
         Ok(signatures)
+    }
+
+    /// The lifecycle machine's answer for a signature, read from the
+    /// registry: a missing entry is `Unknown`.
+    pub fn transaction_lifecycle_state(&self, signature: &Signature) -> TransactionLifecycleState {
+        let _ = signature;
+        todo!()
+    }
+
+    /// The single gate onto the registry's processed state. Applies
+    /// the lifecycle transition first, admitting a previously unseen
+    /// transaction on the way (the synchronous paths decide admission
+    /// and execution in one breath), and refuses a second execution
+    /// instead of silently overwriting the entry. On acceptance:
+    /// stores the entry, queues it for confirmation, and notifies
+    /// signature and logs subscribers at processed commitment.
+    pub fn commit_processed_transaction(&mut self, commit: TransactionCommit) -> SurfpoolResult<()> {
+        let _ = commit;
+        todo!()
     }
 
     /// Creates a new instance of `SurfnetSvm`.
@@ -4207,6 +4241,63 @@ mod tests {
 
     use super::*;
     use crate::storage::tests::TestType;
+
+    fn lifecycle_test_commit(signature: Signature, slot: Slot) -> TransactionCommit {
+        let (status_tx, _status_rx) = unbounded();
+        TransactionCommit {
+            meta: TransactionWithStatusMeta {
+                slot,
+                transaction: VersionedTransaction {
+                    signatures: vec![signature],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            mutated_account_pubkeys: HashSet::new(),
+            status_tx,
+            notified_slot: slot,
+        }
+    }
+
+    #[test]
+    fn the_lifecycle_gate_admits_and_executes_a_new_transaction() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Unknown
+        );
+
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Processed
+        );
+        assert_eq!(svm.transactions_queued_for_confirmation.len(), 1);
+    }
+
+    #[test]
+    fn the_lifecycle_gate_refuses_a_second_execution() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 2))
+            .unwrap_err();
+
+        // The first execution's entry survives, and no second queue
+        // entry was pushed.
+        let stored = svm
+            .transactions
+            .get(&signature.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.expect_processed().0.slot, 1);
+        assert_eq!(svm.transactions_queued_for_confirmation.len(), 1);
+    }
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {

@@ -155,6 +155,17 @@ pub struct TransactionLifecycle {
     state: TransactionLifecycleState,
 }
 
+/// Rehydration: a lifecycle resumed at a persisted state. The state
+/// itself is the product of prior gated transitions, so resuming there
+/// is continuation, never a bypass; every further move still passes
+/// through [`TransactionLifecycle::apply`].
+impl From<TransactionLifecycleState> for TransactionLifecycle {
+    fn from(state: TransactionLifecycleState) -> Self {
+        let _ = state;
+        todo!()
+    }
+}
+
 impl TransactionLifecycle {
     /// A lifecycle at its start: the transaction has arrived and
     /// nothing has been decided.

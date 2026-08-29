@@ -69,6 +69,14 @@ fn the_machine_agrees_with_the_spec_on_every_cell() {
 }
 
 #[test]
+fn a_rehydrated_lifecycle_resumes_at_its_state() {
+    let mut machine = TransactionLifecycle::from(TransactionLifecycleState::Processed);
+    machine.execute().unwrap_err();
+    machine.confirm().unwrap();
+    assert_eq!(machine.state(), TransactionLifecycleState::Confirmed);
+}
+
+#[test]
 fn the_happy_path_reaches_finalized() {
     let mut machine = TransactionLifecycle::new();
     machine.admit().unwrap();
