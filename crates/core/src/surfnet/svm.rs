@@ -971,6 +971,19 @@ impl SurfnetSvm {
             })
     }
 
+    /// The Expire edge: removes an admitted transaction's Received
+    /// image; the signature never resolves. A no-op for every other
+    /// lifecycle state, because expiry exists only between admission
+    /// and execution, and execution-time staleness on a synchronous,
+    /// never-admitted submission has no image to remove.
+    pub fn expire_admitted_transaction(&mut self, signature: &Signature) {
+        let mut lifecycle =
+            TransactionLifecycle::from(self.transaction_lifecycle_state(signature));
+        if lifecycle.expire().is_ok() {
+            let _ = self.transactions.take(&signature.to_string());
+        }
+    }
+
     /// The commitment gate: advances an executed entry's lifecycle in
     /// the registry. The machine decides legality; on acceptance the
     /// entry is rewritten under the advanced state with its payload

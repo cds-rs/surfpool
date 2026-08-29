@@ -2119,6 +2119,45 @@ impl SurfnetSvmLocker {
         Ok(Some(ix_profile_results))
     }
 
+    /// Execution-time staleness: the transaction never lands, so
+    /// nothing is stored, queued, or announced at processed
+    /// commitment. The submitter's status channel still gets the
+    /// failure, which is what synchronous callers read; an admitted
+    /// transaction additionally takes the Expire edge, removing its
+    /// Received image.
+    fn handle_expired_transaction(
+        &self,
+        failed: FailedTransactionMetadata,
+        signature: Signature,
+        pre_execution_capture: ExecutionCapture,
+        status_tx: &Sender<TransactionStatusEvent>,
+        do_propagate: bool,
+    ) -> ProfileResult {
+        let FailedTransactionMetadata { err, meta } = failed;
+        let cus = meta.compute_units_consumed;
+        let logs = meta.logs.clone();
+        let err_string = err.to_string();
+        if do_propagate {
+            let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
+            self.simnet_events_tx()
+                .error(format!("Transaction expired before landing: {err}"));
+            let _ = status_tx.try_send(TransactionStatusEvent::ExecutionFailure((
+                err,
+                meta_canonical,
+            )));
+            self.with_svm_writer(|svm_writer| {
+                svm_writer.expire_admitted_transaction(&signature);
+            });
+        }
+        ProfileResult::new(
+            pre_execution_capture,
+            BTreeMap::new(),
+            cus,
+            Some(logs),
+            Some(err_string),
+        )
+    }
+
     fn handle_simulation_failure(
         &self,
         signature: Signature,
@@ -2496,6 +2535,21 @@ impl SurfnetSvmLocker {
                     status_tx.clone(),
                     do_propagate,
                 ),
+            // Execution-time blockhash staleness never lands: a real
+            // node cannot have a BlockhashNotFound entry on chain. For
+            // an admitted transaction this is the lifecycle's Expire
+            // edge.
+            ProcessTransactionResult::ExecutionFailure(failed)
+                if failed.err == TransactionError::BlockhashNotFound =>
+            {
+                self.handle_expired_transaction(
+                    failed,
+                    transaction.signatures[0],
+                    pre_execution_capture,
+                    status_tx,
+                    do_propagate,
+                )
+            }
             ProcessTransactionResult::ExecutionFailure(failed) => self.handle_execution_failure(
                 failed,
                 transaction,

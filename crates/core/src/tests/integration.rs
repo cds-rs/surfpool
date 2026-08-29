@@ -11175,6 +11175,10 @@ async fn test_stale_blockhash_at_execution_never_lands(test_type: TestType) {
 
     // An admitted transaction: the same failure is the Expire edge,
     // and the Received image is removed; the signature never resolves.
+    // The airdrop above rides the commitment ladder, so the queue
+    // length is compared, never counted absolutely.
+    let queued_before =
+        svm_locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len());
     let tx = build_stale_tx(2_000_000);
     let signature = tx.signatures[0];
     svm_locker
@@ -11192,7 +11196,7 @@ async fn test_stale_blockhash_at_execution_never_lands(test_type: TestType) {
     );
     assert_eq!(
         svm_locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len()),
-        0,
+        queued_before,
         "an expired transaction never rides the commitment ladder"
     );
 }
