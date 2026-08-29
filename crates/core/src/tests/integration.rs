@@ -4639,6 +4639,28 @@ fn boot_simnet(
     })
 }
 
+/// The clock thread's close-paren: dropping both of its channel ends is
+/// the signal that its runloop is gone, and the thread must end rather
+/// than tick into dead channels forever. The SDK's embedded stop leaves
+/// the host process running, so a leaked clock is a production leak,
+/// not test noise.
+#[test]
+fn the_clock_thread_ends_when_its_runloop_drops() {
+    let (clock_event_rx, clock_command_tx, handle) =
+        crate::runloops::start_clock_runloop(1, None);
+    drop(clock_event_rx);
+    drop(clock_command_tx);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        handle.is_finished(),
+        "the clock must stop when its channels disconnect"
+    );
+}
+
 /// A runloop that ends by panicking has finished without having stopped, and
 /// the guard tells the difference. The panic message this prints is the
 /// spawned thread's own, and is expected output.

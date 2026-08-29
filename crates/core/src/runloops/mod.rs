@@ -260,7 +260,9 @@ pub async fn start_local_surfnet_runloop(
         }
     };
 
-    let (clock_event_rx, clock_command_tx) =
+    // The clock thread's handle is deliberately unheld: the thread ends
+    // on its own when this runloop drops the channel ends below.
+    let (clock_event_rx, clock_command_tx, _clock_thread) =
         start_clock_runloop(simnet_config.slot_time, Some(simnet_events_tx_cc.clone()));
 
     // Emit TransactionProcessed events for each stored transaction before Ready
@@ -639,11 +641,11 @@ pub async fn start_block_production_runloop(
 pub fn start_clock_runloop(
     mut slot_time: u64,
     simnet_events_tx: Option<SimnetEventsTx>,
-) -> (Receiver<ClockEvent>, Sender<ClockCommand>) {
+) -> (Receiver<ClockEvent>, Sender<ClockCommand>, JoinHandle<()>) {
     let (clock_event_tx, clock_event_rx) = unbounded::<ClockEvent>();
     let (clock_command_tx, clock_command_rx) = unbounded::<ClockCommand>();
 
-    let _handle = hiro_system_kit::thread_named("clock").spawn(move || {
+    let handle = hiro_system_kit::thread_named("clock").spawn(move || {
         let mut enabled = true;
 
         loop {
@@ -686,7 +688,11 @@ pub fn start_clock_runloop(
         }
     });
 
-    (clock_event_rx, clock_command_tx)
+    (
+        clock_event_rx,
+        clock_command_tx,
+        handle.expect("the clock thread should spawn"),
+    )
 }
 
 fn start_geyser_runloop(
