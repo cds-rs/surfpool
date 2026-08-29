@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 
 /// The lifecycle states, in the order a transaction visits them.
+///
+#[doc = include_str!(concat!(env!("OUT_DIR"), "/transaction-lifecycle.rustdoc.md"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TransactionLifecycleState {
@@ -247,3 +249,6 @@ mod spec;
 
 #[cfg(test)]
 mod conformance_tests;
+
+#[cfg(test)]
+mod spec_doc_tests;

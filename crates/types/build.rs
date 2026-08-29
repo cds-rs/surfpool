@@ -1,17 +1,26 @@
 use std::{env, fs, path::Path};
 
-/// Produces the rustdoc variant of `startup-lifecycle.md`: each mermaid
+/// The spec documents that get a rustdoc variant.
+const SPEC_DOCS: &[&str] = &["startup-lifecycle", "transaction-lifecycle"];
+
+/// Produces the rustdoc variant of each spec document: every mermaid
 /// region is replaced by its pre-rendered SVG from `src/diagrams/`, so
 /// rustdoc shows the drawing while the source file keeps the editable
-/// fence, which GitHub and editors render natively. The test
-/// `the_diagrams_match_their_renderings` holds the SVGs to their sources;
-/// this script only splices.
+/// fence, which GitHub and editors render natively. The per-document
+/// staleness tests hold the SVGs to their sources; this script only
+/// splices.
 fn main() {
-    println!("cargo:rerun-if-changed=src/startup-lifecycle.md");
     println!("cargo:rerun-if-changed=src/diagrams");
+    for doc in SPEC_DOCS {
+        println!("cargo:rerun-if-changed=src/{doc}.md");
+        splice(doc);
+    }
+}
 
+fn splice(doc: &str) {
+    let source_path = format!("src/{doc}.md");
     let source =
-        fs::read_to_string("src/startup-lifecycle.md").expect("startup-lifecycle.md should exist");
+        fs::read_to_string(&source_path).unwrap_or_else(|_| panic!("{source_path} should exist"));
 
     let mut output = String::new();
     let mut rest = source.as_str();
@@ -34,13 +43,20 @@ fn main() {
 
         output.push_str(&rest[..start]);
         let svg_path = format!("src/diagrams/{name}.svg");
-        let svg = fs::read_to_string(&svg_path)
-            .unwrap_or_else(|error| panic!("could not read {svg_path}: {error}"));
-        output.push_str(&svg);
+        // A missing SVG keeps the editable fence in the rustdoc variant
+        // instead of failing the build, so a fresh diagram can be
+        // regenerated and then rendered; the staleness test is what
+        // enforces the SVG's existence.
+        match fs::read_to_string(&svg_path) {
+            Ok(svg) => output.push_str(&svg),
+            Err(_) => {
+                println!("cargo:warning={svg_path} is missing; run the diagram render alias");
+                output.push_str(&rest[start..end]);
+            }
+        }
         rest = &rest[end..];
     }
 
-    let out =
-        Path::new(&env::var("OUT_DIR").expect("OUT_DIR")).join("startup-lifecycle.rustdoc.md");
+    let out = Path::new(&env::var("OUT_DIR").expect("OUT_DIR")).join(format!("{doc}.rustdoc.md"));
     fs::write(out, output).expect("write the rustdoc variant");
 }
