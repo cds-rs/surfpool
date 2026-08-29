@@ -653,7 +653,7 @@ pub trait Full {
         meta: Self::Metadata,
         data: String,
         config: Option<SurfpoolRpcSendTransactionConfig>,
-    ) -> Result<String>;
+    ) -> BoxFuture<Result<String>>;
 
     /// Simulates a transaction without sending it to the network.
     ///
@@ -1732,7 +1732,8 @@ impl Full for SurfpoolFullRpc {
         meta: Self::Metadata,
         data: String,
         config: Option<SurfpoolRpcSendTransactionConfig>,
-    ) -> Result<String> {
+    ) -> BoxFuture<Result<String>> {
+        Box::pin(async move {
         #[cfg(feature = "prometheus")]
         let rpc_start = std::time::Instant::now();
 
@@ -1849,6 +1850,7 @@ impl Full for SurfpoolFullRpc {
             m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
         }
         Ok(signature.to_string())
+        })
     }
 
     fn simulate_transaction(
@@ -2821,14 +2823,12 @@ mod tests {
         let setup_clone = setup.clone();
         let handle = hiro_system_kit::thread_named("send_tx")
             .spawn(move || {
-                let res = setup_clone
-                    .rpc
-                    .send_transaction(
-                        Some(setup_clone.context),
-                        bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
-                        None,
-                    )
-                    .unwrap();
+                let res = jsonrpc_core::futures::executor::block_on(setup_clone.rpc.send_transaction(
+                    Some(setup_clone.context),
+                    bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                    None,
+                ))
+                .unwrap();
 
                 res
             })
@@ -5107,11 +5107,11 @@ mod tests {
             let setup_clone = setup.clone();
             let handle = hiro_system_kit::thread_named("send_tx_skip_verify")
                 .spawn(move || {
-                    setup_clone.rpc.send_transaction(
+                    jsonrpc_core::futures::executor::block_on(setup_clone.rpc.send_transaction(
                         Some(setup_clone.context),
                         tx_encoded,
                         Some(config),
-                    )
+                    ))
                 })
                 .unwrap();
 
