@@ -78,6 +78,7 @@ use surfpool_types::{
     StartupPlanner, SurfnetStartupPhase, SurfnetStartupStatus, SurfnetStartupTask,
     SurfnetStartupTaskState, SurfpoolConfig, UiAccountChange, UiAccountProfileState,
     UiKeyedProfileResult,
+    transaction_lifecycle::TransactionLifecycleState,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
         UuidOrSignature,
@@ -11121,6 +11122,78 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
     assert_eq!(
         after_apply.pending_balance_credit_counter, 0,
         "applying the pending balance resets the credit counter"
+    );
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stale_blockhash_at_execution_never_lands(test_type: TestType) {
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    svm_locker
+        .with_svm_writer(|svm| svm.airdrop(&payer.pubkey(), 10_000_000_000))
+        .unwrap()
+        .unwrap();
+
+    let stale_hash = solana_hash::Hash::new_unique();
+    // The lamports vary so the two submissions carry distinct
+    // signatures.
+    let build_stale_tx = |lamports| {
+        let instruction = transfer(&payer.pubkey(), &recipient, lamports);
+        let message =
+            Message::new_with_blockhash(&[instruction], Some(&payer.pubkey()), &stale_hash);
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap()
+    };
+
+    // A synchronous caller: the failure reaches the status channel,
+    // and nothing lands in the registry (a real node cannot have a
+    // BlockhashNotFound entry on chain).
+    let tx = build_stale_tx(1_000_000);
+    let signature = tx.signatures[0];
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    svm_locker
+        .process_transaction(&None, tx, status_tx, true, false)
+        .await
+        .unwrap();
+    match status_rx.recv() {
+        Ok(TransactionStatusEvent::ExecutionFailure((err, _))) => {
+            assert_eq!(err, solana_transaction_error::TransactionError::BlockhashNotFound);
+        }
+        other => panic!("expected an execution failure, got: {other:?}"),
+    }
+    assert_eq!(
+        svm_locker.with_svm_reader(|svm| svm.transaction_lifecycle_state(&signature)),
+        TransactionLifecycleState::Unknown,
+        "a stale-blockhash failure must not store a ledger entry"
+    );
+
+    // An admitted transaction: the same failure is the Expire edge,
+    // and the Received image is removed; the signature never resolves.
+    let tx = build_stale_tx(2_000_000);
+    let signature = tx.signatures[0];
+    svm_locker
+        .with_svm_writer(|svm| svm.admit_transaction(&signature))
+        .unwrap();
+    let (status_tx, _status_rx) = crossbeam_unbounded();
+    svm_locker
+        .process_transaction(&None, tx, status_tx, true, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        svm_locker.with_svm_reader(|svm| svm.transaction_lifecycle_state(&signature)),
+        TransactionLifecycleState::Unknown,
+        "expiry removes the admitted image"
+    );
+    assert_eq!(
+        svm_locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len()),
+        0,
+        "an expired transaction never rides the commitment ladder"
     );
 }
 
