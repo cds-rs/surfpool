@@ -1,6 +1,4 @@
 #![allow(dead_code)]
-use std::net::TcpListener;
-
 use crossbeam_channel::{Receiver, Sender};
 use solana_clock::Clock;
 use solana_epoch_info::EpochInfo;
@@ -13,14 +11,8 @@ use crate::{
 };
 
 pub fn get_free_port() -> Result<u16, String> {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Failed to bind to port 0: {}", e))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("failed to parse address: {}", e))?
-        .port();
-    drop(listener);
-    Ok(port)
+    surfpool_types::find_available_port()
+        .map_err(|e| format!("Failed to find an available port: {}", e))
 }
 
 #[derive(Clone)]
@@ -118,5 +110,34 @@ where
                 .await
                 .unwrap();
         }
+    }
+}
+
+/// A port handed out recently is not handed out again.
+///
+/// The probe binds `:0`, reads the assigned port, and drops the listener,
+/// so the OS is free to hand the released port to the next probe. Two
+/// callers in one process can then receive the same port, and the slower
+/// binder loses.
+///
+/// The trailing window here is smaller than the 128-port recency window
+/// the fix keeps, so other tests in this binary drawing ports concurrently
+/// cannot evict a port early and fail this test spuriously.
+#[test]
+fn a_recently_handed_out_port_is_not_handed_out_again() {
+    use std::collections::VecDeque;
+
+    let mut recent: VecDeque<u16> = VecDeque::new();
+    for i in 0..4000 {
+        let port = get_free_port().unwrap();
+        assert!(
+            !recent.contains(&port),
+            "port {port} handed out twice within {} calls (probe {i})",
+            recent.len()
+        );
+        if recent.len() == 64 {
+            recent.pop_front();
+        }
+        recent.push_back(port);
     }
 }

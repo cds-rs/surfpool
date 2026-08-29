@@ -1,5 +1,4 @@
 use std::{
-    net::TcpListener,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -370,14 +369,7 @@ impl Drop for Surfnet {
 }
 
 fn get_free_port() -> SurfnetResult<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| SurfnetError::PortAllocation(e.to_string()))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| SurfnetError::PortAllocation(e.to_string()))?
-        .port();
-    drop(listener);
-    Ok(port)
+    surfpool_types::find_available_port().map_err(|e| SurfnetError::PortAllocation(e.to_string()))
 }
 
 fn wait_for_ready(events_rx: &Receiver<SimnetEvent>) -> SurfnetResult<()> {

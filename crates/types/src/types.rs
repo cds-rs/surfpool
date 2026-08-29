@@ -944,6 +944,39 @@ impl RpcConfig {
     }
 }
 
+/// Finds a free TCP port while avoiding duplicate in-process assignments.
+///
+/// Binding to `:0` only probes availability: the listener must be dropped
+/// before the caller can bind, so the OS may immediately hand the port to
+/// another `bind(:0)`. Remembering recently returned ports prevents callers
+/// in this process from racing for the same port during that gap.
+///
+/// # Limitations
+///
+/// This does not prevent races with other processes.
+pub fn find_available_port() -> std::io::Result<u16> {
+    use std::{collections::VecDeque, net::TcpListener, sync::Mutex};
+
+    static RECENT: Mutex<VecDeque<u16>> = Mutex::new(VecDeque::new());
+    const WINDOW: usize = 128;
+
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+
+        let mut recent = RECENT.lock().unwrap();
+        if recent.contains(&port) {
+            continue;
+        }
+        if recent.len() == WINDOW {
+            recent.pop_front();
+        }
+        recent.push_back(port);
+        return Ok(port);
+    }
+}
+
 impl Default for RpcConfig {
     fn default() -> Self {
         Self {
@@ -1893,6 +1926,33 @@ mod tests {
     use solana_account_decoder_client_types::{ParsedAccount, UiAccountData};
 
     use super::*;
+
+    /// Sequential finds within the recency window never repeat, even
+    /// though every probe listener is dropped before the next bind.
+    #[test]
+    fn found_ports_stay_distinct_within_the_window() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let port = find_available_port().unwrap();
+            assert!(
+                seen.insert(port),
+                "port {port} handed out twice within the window"
+            );
+        }
+    }
+
+    /// Concurrent finds are distinct: the window filters the reuse the
+    /// OS is otherwise free to perform between a probe's drop and the
+    /// caller's bind.
+    #[test]
+    fn concurrent_finds_are_distinct() {
+        let handles: Vec<_> = (0..16)
+            .map(|_| std::thread::spawn(|| find_available_port().unwrap()))
+            .collect();
+        let ports: Vec<u16> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let unique: std::collections::HashSet<_> = ports.iter().collect();
+        assert_eq!(unique.len(), ports.len(), "duplicate port among {ports:?}");
+    }
 
     #[test]
     fn test_disable_cheatcode_with_lockout_allows_protected_methods() {
