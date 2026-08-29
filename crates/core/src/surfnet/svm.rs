@@ -27,7 +27,7 @@ use solana_client::{
     rpc_filter::RpcFilterType,
     rpc_response::{RpcKeyedAccount, RpcLogsResponse, RpcPerfSample},
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::{Clock, MAX_PROCESSING_AGE, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
@@ -1591,6 +1591,29 @@ impl SurfnetSvm {
     ///
     /// # Returns
     /// `true` if the blockhash is recent, `false` otherwise.
+    /// The age in blocks of a recent blockhash: 0 for the tip's own
+    /// hash, `None` for a hash outside the recent window. The
+    /// RecentBlockhashes sysvar iterates newest first, so an entry's
+    /// position is its age.
+    pub fn recent_blockhash_age(&self, recent_blockhash: &Hash) -> Option<u64> {
+        #[allow(deprecated)]
+        self.inner
+            .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>()
+            .iter()
+            .position(|entry| entry.blockhash == *recent_blockhash)
+            .map(|position| position as u64)
+    }
+
+    /// The block height at which the hash stops being accepted for
+    /// processing: the height it was produced at plus
+    /// `MAX_PROCESSING_AGE`. `None` for a hash outside the recent
+    /// window.
+    pub fn last_valid_block_height_for_hash(&self, recent_blockhash: &Hash) -> Option<u64> {
+        self.recent_blockhash_age(recent_blockhash).map(|age| {
+            self.latest_epoch_info.block_height.saturating_sub(age) + MAX_PROCESSING_AGE as u64
+        })
+    }
+
     pub fn check_blockhash_is_recent(&self, recent_blockhash: &Hash) -> bool {
         #[allow(deprecated)]
         self.inner
@@ -4352,6 +4375,29 @@ mod tests {
             status_tx,
             notified_slot: slot,
         }
+    }
+
+    #[test]
+    fn recent_blockhash_age_counts_back_from_the_tip() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        // One tick first: at initialization the chain tip's hash sits
+        // one behind the reconstructed sysvar; after a produced block
+        // the tip's hash leads it, which is the steady state the age
+        // is defined against.
+        svm.confirm_current_block().unwrap();
+        let hash = svm.latest_blockhash();
+        let height_at_hash = svm.latest_epoch_info.block_height;
+        assert_eq!(svm.recent_blockhash_age(&hash), Some(0));
+
+        svm.confirm_current_block().unwrap();
+        svm.confirm_current_block().unwrap();
+
+        assert_eq!(svm.recent_blockhash_age(&hash), Some(2));
+        assert_eq!(
+            svm.last_valid_block_height_for_hash(&hash),
+            Some(height_at_hash + MAX_PROCESSING_AGE as u64)
+        );
+        assert_eq!(svm.recent_blockhash_age(&Hash::new_unique()), None);
     }
 
     #[test]

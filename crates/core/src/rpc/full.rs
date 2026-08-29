@@ -49,7 +49,7 @@ use crate::{
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
     surfnet::{
         CoupledAccount, FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GetTransactionResult,
-        locker::SvmAccessContext, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
+        locker::SvmAccessContext,
     },
     types::surfpool_tx_metadata_to_litesvm_tx_metadata,
 };
@@ -2448,8 +2448,21 @@ impl Full for SurfpoolFullRpc {
             .get_latest_blockhash(&commitment)
             .unwrap_or_else(|| svm_locker.latest_absolute_blockhash());
 
+        // The committed slot's hash can already be up to the commitment
+        // offset old, so its validity window is anchored at the height
+        // it was produced, and the age-aware answer shrinks with the
+        // hash rather than promising the full window from the current
+        // height. The sysvar answers for hashes it holds; for one it
+        // does not (a block header written outside block production),
+        // the committed slot itself is the anchor.
         let current_block_height = svm_locker.get_epoch_info().block_height;
-        let last_valid_block_height = current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+        let latest_slot = svm_locker.get_latest_absolute_slot();
+        let last_valid_block_height = svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.last_valid_block_height_for_hash(&blockhash))
+            .unwrap_or_else(|| {
+                current_block_height.saturating_sub(latest_slot - committed_latest_slot)
+                    + solana_clock::MAX_PROCESSING_AGE as u64
+            });
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: RpcBlockhash {
@@ -3816,8 +3829,15 @@ mod tests {
                 .unwrap();
 
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            // The returned hash is the committed slot's, so its validity
+            // window is anchored at that slot's height, and the answer
+            // shrinks by the hash's age rather than promising the full
+            // window from the current height.
+            let committed_slot = setup.context.svm_locker.get_slot_for_commitment(&commitment);
+            let latest_slot = setup.context.svm_locker.get_latest_absolute_slot();
+            let expected_last_valid_block_height = current_block_height
+                - (latest_slot - committed_slot)
+                + solana_clock::MAX_PROCESSING_AGE as u64;
 
             assert_eq!(
                 res.value.blockhash,
@@ -3850,8 +3870,15 @@ mod tests {
                 .unwrap();
 
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            // The returned hash is the committed slot's, so its validity
+            // window is anchored at that slot's height, and the answer
+            // shrinks by the hash's age rather than promising the full
+            // window from the current height.
+            let committed_slot = setup.context.svm_locker.get_slot_for_commitment(&commitment);
+            let latest_slot = setup.context.svm_locker.get_latest_absolute_slot();
+            let expected_last_valid_block_height = current_block_height
+                - (latest_slot - committed_slot)
+                + solana_clock::MAX_PROCESSING_AGE as u64;
 
             assert_eq!(
                 res.value.blockhash,
@@ -3884,8 +3911,15 @@ mod tests {
                 .unwrap();
 
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            // The returned hash is the committed slot's, so its validity
+            // window is anchored at that slot's height, and the answer
+            // shrinks by the hash's age rather than promising the full
+            // window from the current height.
+            let committed_slot = setup.context.svm_locker.get_slot_for_commitment(&commitment);
+            let latest_slot = setup.context.svm_locker.get_latest_absolute_slot();
+            let expected_last_valid_block_height = current_block_height
+                - (latest_slot - committed_slot)
+                + solana_clock::MAX_PROCESSING_AGE as u64;
 
             assert_eq!(
                 res.value.blockhash,
