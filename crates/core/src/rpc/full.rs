@@ -35,8 +35,8 @@ use solana_transaction_status::{
     UiTransactionEncoding,
 };
 use surfpool_types::{
-    ProcessTransactionRequest, SimnetCommand, TransactionStatusEvent,
-    transaction_lifecycle::TransactionBlockhashValidation,
+    ProcessTransactionRequest, SimnetCommand,
+    transaction_lifecycle::{TransactionBlockhashValidation, TransactionLifecycleState},
 };
 
 use super::{
@@ -54,7 +54,6 @@ use crate::{
         CoupledAccount, FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GetTransactionResult,
         locker::SvmAccessContext,
     },
-    types::surfpool_tx_metadata_to_litesvm_tx_metadata,
 };
 
 const MAX_PRIORITIZATION_FEE_BLOCKS_CACHE: usize = 150;
@@ -1750,106 +1749,175 @@ impl Full for SurfpoolFullRpc {
             }
             .into());
         };
+        let svm_locker = ctx.svm_locker.clone();
+        let remote_ctx = ctx.remote_rpc_client.clone().map(|client| {
+            (
+                client,
+                config
+                    .base
+                    .preflight_commitment
+                    .map(|commitment| CommitmentConfig { commitment })
+                    .unwrap_or_else(CommitmentConfig::confirmed),
+            )
+        });
 
-        let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
-        ctx.simnet_commands_tx
-            .send(SimnetCommand::ProcessTransaction(ProcessTransactionRequest {
-                id: ctx.id,
-                transaction: unsanitized_tx,
-                status_tx: status_update_tx,
-                skip_preflight: config.base.skip_preflight,
-                skip_sig_verify: config.skip_sig_verify,
-                blockhash_validation: TransactionBlockhashValidation::ValidateAtExecution,
-            }))
-            .map_err(|_| RpcCustomError::NodeUnhealthy {
-                num_slots_behind: None,
-            })?;
-
-        match status_update_rx.recv() {
-            Ok(TransactionStatusEvent::SimulationFailure((error, metadata))) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                    m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
-                }
-                return Err(Error {
-                    data: Some(
-                        serde_json::to_value(get_simulate_transaction_result(
-                            surfpool_tx_metadata_to_litesvm_tx_metadata(&metadata),
-                            None,
-                            Some(error.clone()),
-                            None,
-                            false,
+        let result: Result<String> = async {
+            // The registry's answer decides the duplicate rows of the
+            // admission table before any check runs. Expired and
+            // Rejected store no image, so they read as Unknown here
+            // and fall to the checks (an expired transaction's own
+            // blockhash refuses it).
+            let lifecycle = svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.transaction_lifecycle_state(&signature));
+            match lifecycle {
+                // Clients resend the same wire transaction in retry
+                // loops; a resend is idempotent and dispatches
+                // nothing.
+                TransactionLifecycleState::Admitted => return Ok(signature.to_string()),
+                TransactionLifecycleState::Processed
+                | TransactionLifecycleState::Confirmed
+                | TransactionLifecycleState::Finalized => {
+                    return if config.base.skip_preflight {
+                        // agave forwards and the bank drops the
+                        // duplicate; answering with the signature is
+                        // observably equivalent.
+                        Ok(signature.to_string())
+                    } else {
+                        Err(admission_failure_error(
+                            &TransactionError::AlreadyProcessed,
+                            &TransactionMetadata::default(),
                             &tx_message,
-                            None, // No loaded addresses available in error reporting context
-                            None,
-                        ))
-                        .map_err(|e| {
-                            Error::invalid_params(format!(
-                                "Failed to serialize simulation result: {e}"
-                            ))
-                        })?,
-                    ),
-                    message: format!(
-                        "Transaction simulation failed: {}{}",
-                        error,
-                        if metadata.logs.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                ": {} log messages:\n{}",
-                                metadata.logs.len(),
-                                metadata.logs.iter().map(|l| l.to_string()).join("\n")
-                            )
-                        }
-                    ),
-                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                });
+                        )?)
+                    };
+                }
+                _ => {}
             }
-            Ok(TransactionStatusEvent::ExecutionFailure(_)) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
+
+            let (global_skip_sig_verify, skip_blockhash_check, uses_durable_nonce) = svm_locker
+                .with_svm_reader(|svm_reader| {
+                    (
+                        svm_reader.skip_signature_verification,
+                        svm_reader.skip_blockhash_check,
+                        svm_reader.transaction_uses_durable_nonce(&unsanitized_tx),
+                    )
+                });
+            let skip_sig_verify = config.skip_sig_verify.unwrap_or(global_skip_sig_verify);
+
+            if !skip_sig_verify {
+                if let Err(failed) =
+                    svm_locker.with_svm_reader(|svm_reader| svm_reader.sigverify(&unsanitized_tx))
+                {
+                    return Err(Error {
+                        data: None,
+                        message: format!(
+                            "Transaction verification failed for transaction {signature}: {}",
+                            failed.err
+                        ),
+                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                    });
                 }
             }
-            Ok(TransactionStatusEvent::VerificationFailure(signature)) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                    m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
-                }
-                return Err(Error {
-                    data: None,
-                    message: format!("Transaction verification failed for transaction {signature}"),
-                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
+
+            // A durable-nonce transaction's validity anchors to the
+            // nonce account's execution-time state, so recency is not
+            // an admission question for it.
+            if !uses_durable_nonce && !skip_blockhash_check {
+                let is_recent = svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader.check_blockhash_is_recent(unsanitized_tx.message.recent_blockhash())
                 });
-            }
-            Err(e) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                    m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
+                if !is_recent {
+                    return Err(admission_failure_error(
+                        &TransactionError::BlockhashNotFound,
+                        &TransactionMetadata::default(),
+                        &tx_message,
+                    )?);
                 }
-                return Err(Error {
-                    data: None,
-                    message: format!("Failed to process transaction: {e}"),
-                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                });
             }
-            Ok(TransactionStatusEvent::Success(_)) =>
+
+            if !config.base.skip_preflight {
+                let loaded_addresses = svm_locker
+                    .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
+                    .await
+                    .map_err(Error::from)?;
+                let transaction_pubkeys = svm_locker.get_pubkeys_from_message(
+                    &unsanitized_tx.message,
+                    loaded_addresses
+                        .as_ref()
+                        .map(|loaded| loaded.all_loaded_addresses()),
+                );
+                svm_locker
+                    .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
+                    .await
+                    .map_err(Error::from)?;
+                // Signatures were verified above (or skipped by
+                // policy); the simulation decides executability.
+                if let Err(failed) =
+                    svm_locker.simulate_transaction(unsanitized_tx.clone(), false)
+                {
+                    return Err(admission_failure_error(&failed.err, &failed.meta, &tx_message)?);
+                }
+            }
+
+            // The admission gate. A refusal means the signature raced
+            // in through another submission between the read above and
+            // this write; the duplicate rows answer it.
+            if svm_locker
+                .with_svm_writer(|svm_writer| svm_writer.admit_transaction(&signature))
+                .is_err()
             {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(true, rpc_start.elapsed().as_millis() as u64);
-                }
+                let state = svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader.transaction_lifecycle_state(&signature)
+                });
+                return if state == TransactionLifecycleState::Admitted
+                    || config.base.skip_preflight
+                {
+                    Ok(signature.to_string())
+                } else {
+                    Err(admission_failure_error(
+                        &TransactionError::AlreadyProcessed,
+                        &TransactionMetadata::default(),
+                        &tx_message,
+                    )?)
+                };
             }
+
+            let blockhash_validation = if uses_durable_nonce {
+                TransactionBlockhashValidation::ValidateAtExecution
+            } else {
+                TransactionBlockhashValidation::ValidatedAtAdmission
+            };
+            // The submitter reads nothing back: admission has already
+            // answered, and clients learn the outcome by signature.
+            // Every send into this channel is lossy by design, so the
+            // dropped receiver is harmless.
+            let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
+            drop(status_update_rx);
+            ctx.simnet_commands_tx
+                .send(SimnetCommand::ProcessTransaction(ProcessTransactionRequest {
+                    id: ctx.id.clone(),
+                    transaction: unsanitized_tx,
+                    status_tx: status_update_tx,
+                    // Admission simulated already (or the caller opted
+                    // out); execution must not repeat preflight.
+                    skip_preflight: true,
+                    skip_sig_verify: config.skip_sig_verify,
+                    blockhash_validation,
+                }))
+                .map_err(|_| {
+                    Error::from(RpcCustomError::NodeUnhealthy {
+                        num_slots_behind: None,
+                    })
+                })?;
+            Ok(signature.to_string())
         }
+        .await;
 
         #[cfg(feature = "prometheus")]
         if let Some(m) = crate::telemetry::metrics() {
+            m.record_transaction(result.is_ok(), rpc_start.elapsed().as_millis() as u64);
             m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
         }
-        Ok(signature.to_string())
+        result
         })
     }
 
@@ -2703,6 +2771,47 @@ impl Full for SurfpoolFullRpc {
     }
 }
 
+/// The -32002 answer for a transaction refused at admission, shaped as
+/// a preflight simulation failure: agave reports admission refusals
+/// through the simulation error format, and clients parse it.
+fn admission_failure_error(
+    error: &TransactionError,
+    metadata: &TransactionMetadata,
+    tx_message: &VersionedMessage,
+) -> Result<Error> {
+    Ok(Error {
+        data: Some(
+            serde_json::to_value(get_simulate_transaction_result(
+                metadata.clone(),
+                None,
+                Some(error.clone()),
+                None,
+                false,
+                tx_message,
+                None,
+                None,
+            ))
+            .map_err(|e| {
+                Error::invalid_params(format!("Failed to serialize simulation result: {e}"))
+            })?,
+        ),
+        message: format!(
+            "Transaction simulation failed: {}{}",
+            error,
+            if metadata.logs.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {} log messages:\n{}",
+                    metadata.logs.len(),
+                    metadata.logs.iter().map(|log| log.to_string()).join("\n")
+                )
+            }
+        ),
+        code: jsonrpc_core::ErrorCode::ServerError(-32002),
+    })
+}
+
 fn get_simulate_transaction_result(
     metadata: TransactionMetadata,
     accounts: Option<Vec<Option<UiAccount>>>,
@@ -2779,7 +2888,7 @@ mod tests {
         EncodedTransaction, EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage,
         UiRawMessage, UiTransaction, UiTransactionEncoding,
     };
-    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
+    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus, TransactionStatusEvent};
     use test_case::test_case;
 
     use surfpool_types::transaction_lifecycle::TransactionLifecycleState;
@@ -2863,11 +2972,11 @@ mod tests {
                             ),
                         )
                         .unwrap();
-                    status_tx
-                        .send(TransactionStatusEvent::Success(
-                            TransactionConfirmationStatus::Confirmed,
-                        ))
-                        .unwrap();
+                    // Advisory: the handler answered at admission and
+                    // dropped its receiver.
+                    let _ = status_tx.send(TransactionStatusEvent::Success(
+                        TransactionConfirmationStatus::Confirmed,
+                    ));
                     break;
                 }
                 Ok(SimnetCommand::AirdropProcessed) => continue,
@@ -5516,11 +5625,11 @@ mod tests {
                                 ),
                             )
                             .unwrap();
-                        status_tx
-                            .send(TransactionStatusEvent::Success(
-                                TransactionConfirmationStatus::Processed,
-                            ))
-                            .unwrap();
+                        // Advisory: the handler answered at admission
+                        // and dropped its receiver.
+                        let _ = status_tx.send(TransactionStatusEvent::Success(
+                            TransactionConfirmationStatus::Processed,
+                        ));
                         break;
                     }
                     _ => continue,

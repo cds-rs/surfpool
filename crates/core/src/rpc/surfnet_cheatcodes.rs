@@ -2150,18 +2150,19 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .transactions
                 .into_iter()
                 .map(|iter| {
-                    iter.map(|(sig, status)| {
-                        let (transaction_with_status_meta, _) = status.expect_processed();
-                        (
+                    // An admitted, not yet executed entry has no logs
+                    // to report.
+                    iter.filter_map(|(sig, status)| {
+                        let (transaction_with_status_meta, _) = status.as_processed()?;
+                        Some((
                             sig,
                             transaction_with_status_meta.slot,
-                            transaction_with_status_meta.meta.status.clone().err(),
+                            transaction_with_status_meta.meta.status.err(),
                             transaction_with_status_meta
                                 .meta
                                 .log_messages
-                                .clone()
                                 .unwrap_or_default(),
-                        )
+                        ))
                     })
                     .collect()
                 })

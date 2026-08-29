@@ -1653,7 +1653,12 @@ impl SurfnetSvmLocker {
                 return Ok(GetTransactionResult::None(*signature));
             };
 
-            let (transaction_with_status_meta, _) = entry.expect_processed();
+            // An admitted, not yet executed entry answers as a real
+            // node's in-flight window does: null.
+            let Some((transaction_with_status_meta, _)) = entry.as_processed() else {
+                return Ok(GetTransactionResult::None(*signature));
+            };
+            let transaction_with_status_meta = &transaction_with_status_meta;
             let slot = transaction_with_status_meta.slot;
             // `None` (spec: null) when the block isn't stored — never a fake 0.
             let block_time = svm_reader

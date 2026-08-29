@@ -3417,8 +3417,8 @@ impl SurfnetSvm {
                     .signatures
                     .iter()
                     .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
-                    .map(|tx_with_meta| {
-                        let (meta, _) = tx_with_meta.expect_processed();
+                    .filter_map(|tx_with_meta| tx_with_meta.as_processed())
+                    .map(|(meta, _)| {
                         meta.encode(
                             config.encoding.unwrap_or(
                                 solana_transaction_status::UiTransactionEncoding::JsonParsed,
@@ -3437,8 +3437,8 @@ impl SurfnetSvm {
                     .signatures
                     .iter()
                     .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
-                    .map(|tx_with_meta| {
-                        let (meta, _) = tx_with_meta.expect_processed();
+                    .filter_map(|tx_with_meta| tx_with_meta.as_processed())
+                    .map(|(meta, _)| {
                         meta.to_json_accounts(
                             config.max_supported_transaction_version,
                             show_rewards,

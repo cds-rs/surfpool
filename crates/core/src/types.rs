@@ -313,7 +313,9 @@ impl SurfnetTransactionStatus {
     /// finalized entries answer "processed" questions too.
     pub fn expect_processed(&self) -> &(TransactionWithStatusMeta, HashSet<Pubkey>) {
         match &self {
-            SurfnetTransactionStatus::Received => unreachable!(),
+            SurfnetTransactionStatus::Received => {
+                unreachable!("expect_processed on an admitted, not yet executed entry")
+            }
             SurfnetTransactionStatus::Processed(data)
             | SurfnetTransactionStatus::Confirmed(data)
             | SurfnetTransactionStatus::Finalized(data) => data,
