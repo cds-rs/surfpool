@@ -95,10 +95,12 @@ state (`Received` for admitted, then `Processed`, `Confirmed`,
 machine from that image, so resuming at a persisted state is
 continuation of prior gated transitions, never a bypass.
 
-N.B. The wire projection still derives a transaction's commitment
-level from slot distance; the stored lifecycle is the durable record
-the drains maintain. The two agree today because the drains and the
-slot arithmetic advance on the same ticks.
+N.B. The wire projection reads the stored lifecycle: a transaction's
+commitment level on the wire is the registry entry's state, and the
+drains are what advance it, never the clock. A remote transaction has
+no local lifecycle, so the remote lookup path keeps slot arithmetic;
+the confirmations count stays arithmetic everywhere, because it is a
+count rather than the status.
 
 <!-- BEGIN GENERATED: links -->
 [TransactionLifecycleState::Admitted]: TransactionLifecycleState::Admitted
