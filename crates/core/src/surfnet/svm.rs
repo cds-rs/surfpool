@@ -4283,6 +4283,97 @@ mod tests {
     }
 
     #[test]
+    fn confirming_a_block_advances_committed_entries() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+
+        svm.confirm_transactions().unwrap();
+
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Confirmed
+        );
+        assert_eq!(svm.transactions_queued_for_confirmation.len(), 0);
+        assert_eq!(svm.transactions_queued_for_finalization.len(), 1);
+    }
+
+    #[test]
+    fn finalizing_advances_entries_past_the_threshold() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+        svm.confirm_transactions().unwrap();
+
+        svm.latest_epoch_info.absolute_slot += FINALIZATION_SLOT_THRESHOLD;
+        svm.finalize_transactions().unwrap();
+
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Finalized
+        );
+        assert_eq!(svm.transactions_queued_for_finalization.len(), 0);
+    }
+
+    #[test]
+    fn a_confirmed_entry_still_reads_as_executed() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        svm.airdrop(&payer.pubkey(), 2_000_000_000).unwrap().unwrap();
+        let blockhash = svm.latest_blockhash();
+        let tx = build_transfer_transaction(&payer, &recipient, 1_000_000, blockhash);
+        let signature = tx.signatures[0];
+
+        let mut commit = lifecycle_test_commit(signature, 1);
+        commit.meta.transaction = tx.clone();
+        svm.commit_processed_transaction(commit).unwrap();
+        svm.confirm_transactions().unwrap();
+
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Confirmed
+        );
+        // Duplicate rejection must hold past processed commitment.
+        let err = svm.sigverify(&tx).unwrap_err().err;
+        assert_eq!(err, TransactionError::AlreadyProcessed);
+        // The executed payload stays readable through the helpers.
+        let stored = svm
+            .transactions
+            .get(&signature.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.expect_processed().0.slot, 1);
+    }
+
+    /// The characterization half of the drain change: a queue entry
+    /// with no registry row (evicted, or a store that failed) keeps
+    /// today's behavior, riding the commitment ladder without touching
+    /// the registry.
+    #[test]
+    fn a_ghost_confirmation_entry_leaves_the_registry_untouched() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        let ghost = VersionedTransaction {
+            signatures: vec![signature],
+            ..Default::default()
+        };
+        let (status_tx, _status_rx) = unbounded();
+        svm.transactions_queued_for_confirmation
+            .push_back((ghost, status_tx, None));
+
+        svm.confirm_transactions().unwrap();
+
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Unknown
+        );
+        assert_eq!(svm.transactions_queued_for_finalization.len(), 1);
+    }
+
+    #[test]
     fn the_lifecycle_gate_admits_and_executes_a_new_transaction() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         let signature = Signature::new_unique();
