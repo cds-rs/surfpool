@@ -45,6 +45,17 @@ pub enum TransactionLifecycleState {
     Expired,
 }
 
+/// When a transaction's blockhash recency is decided: once at
+/// admission and trusted after, or at execution time. This is the
+/// policy on the Expire edge: recency validated at admission cannot
+/// expire, and a durable-nonce transaction validates at execution
+/// because a nonce's validity depends on execution-time state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionBlockhashValidation {
+    ValidatedAtAdmission,
+    ValidateAtExecution,
+}
+
 /// The transition alphabet: every move a caller can attempt on the
 /// machine. The named methods on [`TransactionLifecycle`] are wrappers
 /// that pass one of these through [`TransactionLifecycle::apply`], so

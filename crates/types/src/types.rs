@@ -764,6 +764,9 @@ pub struct ProcessTransactionRequest {
     /// Per-request override of the global signature verification
     /// setting; `None` defers to the process-wide flag.
     pub skip_sig_verify: Option<bool>,
+    /// When the transaction's blockhash recency is decided; admission
+    /// chooses, and execution honors the choice.
+    pub blockhash_validation: crate::transaction_lifecycle::TransactionBlockhashValidation,
 }
 
 #[derive(Debug)]

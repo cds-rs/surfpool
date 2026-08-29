@@ -34,7 +34,10 @@ use solana_transaction_status::{
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
     UiTransactionEncoding,
 };
-use surfpool_types::{ProcessTransactionRequest, SimnetCommand, TransactionStatusEvent};
+use surfpool_types::{
+    ProcessTransactionRequest, SimnetCommand, TransactionStatusEvent,
+    transaction_lifecycle::TransactionBlockhashValidation,
+};
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
@@ -1755,6 +1758,7 @@ impl Full for SurfpoolFullRpc {
                 status_tx: status_update_tx,
                 skip_preflight: config.base.skip_preflight,
                 skip_sig_verify: config.skip_sig_verify,
+                blockhash_validation: TransactionBlockhashValidation::ValidateAtExecution,
             }))
             .map_err(|_| RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,

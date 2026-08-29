@@ -264,6 +264,7 @@ pub struct SurfnetSvmConfig {
     pub max_profiles: usize,
     pub log_bytes_limit: Option<usize>,
     pub skip_blockhash_check: bool,
+    pub skip_signature_verification: bool,
 }
 
 impl Default for SurfnetSvmConfig {
@@ -276,6 +277,7 @@ impl Default for SurfnetSvmConfig {
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
             log_bytes_limit: DEFAULT_LOG_BYTES_LIMIT,
             skip_blockhash_check: false,
+            skip_signature_verification: false,
         }
     }
 }
@@ -348,6 +350,7 @@ pub struct SurfnetSvm {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
+    pub skip_signature_verification: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
     /// The startup state machine. Kept private so that every mutation goes
     /// through [`Self::seal_startup_plan`] and its sibling wrappers, which
@@ -628,6 +631,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
             skip_blockhash_check: self.skip_blockhash_check,
+            skip_signature_verification: self.skip_signature_verification,
             runbook_executions: self.runbook_executions.clone(),
             startup_status: self.startup_status.clone(),
             // Same rule as the dummy event channels above: the sandbox gets a
@@ -929,6 +933,44 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// The admission gate: records an accepted, not yet executed
+    /// transaction as the registry's `Received` image and notifies
+    /// received-subscribers, refusing a signature the lifecycle has
+    /// already seen. The caller decides what a refusal means on the
+    /// wire (a resend of an in-flight transaction is idempotent).
+    pub fn admit_transaction(&mut self, signature: &Signature) -> SurfpoolResult<()> {
+        let mut lifecycle =
+            TransactionLifecycle::from(self.transaction_lifecycle_state(signature));
+        lifecycle
+            .admit()
+            .map_err(|refusal| SurfpoolError::transaction_lifecycle(*signature, refusal.kind()))?;
+        self.transactions
+            .store(signature.to_string(), SurfnetTransactionStatus::Received)?;
+        let slot = self.get_latest_absolute_slot();
+        self.notify_signature_subscribers(
+            SignatureSubscriptionType::received(),
+            signature,
+            slot,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Whether the transaction is nonced: its marker instruction is a
+    /// system-program nonce advance, which anchors validity to the
+    /// nonce account's state instead of blockhash recency.
+    pub fn transaction_uses_durable_nonce(&self, tx: &VersionedTransaction) -> bool {
+        tx.message
+            .instructions()
+            .get(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
+            .is_some_and(|instruction| {
+                matches!(
+                    tx.message.static_account_keys().get(instruction.program_id_index as usize),
+                    Some(program_id) if system_program::check_id(program_id)
+                ) && is_advance_nonce_instruction_data(&instruction.data)
+            })
+    }
+
     /// The commitment gate: advances an executed entry's lifecycle in
     /// the registry. The machine decides legality; on acceptance the
     /// entry is rewritten under the advanced state with its payload
@@ -1178,6 +1220,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
+            skip_signature_verification: config.skip_signature_verification,
             runbook_executions: Vec::new(),
             startup_status: SurfnetStartupStatus::default(),
             startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
@@ -1638,20 +1681,15 @@ impl SurfnetSvm {
 
         let recent_blockhash = tx.message.recent_blockhash();
 
-        let some_nonce_account_index = tx
-            .message
-            .instructions()
-            .get(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
-            .filter(|instruction| {
-                matches!(
-                    tx.message.static_account_keys().get(instruction.program_id_index as usize),
-                    Some(program_id) if system_program::check_id(program_id)
-                ) && is_advance_nonce_instruction_data(&instruction.data)
-            })
-            .map(|instruction| {
+        let some_nonce_account_index = if self.transaction_uses_durable_nonce(tx) {
+            tx.message
+                .instructions()
+                .get(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
                 // nonce account is the first account in the instruction
-                instruction.accounts.get(0)
-            });
+                .map(|instruction| instruction.accounts.first())
+        } else {
+            None
+        };
 
         debug!(
             "Validating tx blockhash: {}; is nonce tx?: {}",
@@ -4378,6 +4416,58 @@ mod tests {
     }
 
     #[test]
+    fn admitting_a_transaction_stores_the_received_image() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+
+        svm.admit_transaction(&signature).unwrap();
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Admitted
+        );
+
+        // Admitted at most once; a resend's idempotent answer is the
+        // caller's mapping of this refusal.
+        svm.admit_transaction(&signature).unwrap_err();
+
+        // Execution proceeds from the admitted image.
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Processed
+        );
+    }
+
+    #[test]
+    fn durable_nonce_detection_reads_the_marker_instruction() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let payer = Keypair::new();
+        let nonce_account = Pubkey::new_unique();
+
+        let advance =
+            system_instruction::advance_nonce_account(&nonce_account, &payer.pubkey());
+        let nonced = VersionedTransaction {
+            signatures: vec![Signature::new_unique()],
+            message: VersionedMessage::Legacy(solana_message::Message::new(
+                &[advance],
+                Some(&payer.pubkey()),
+            )),
+        };
+        assert!(svm.transaction_uses_durable_nonce(&nonced));
+
+        let transfer = system_instruction::transfer(&payer.pubkey(), &nonce_account, 1);
+        let plain = VersionedTransaction {
+            signatures: vec![Signature::new_unique()],
+            message: VersionedMessage::Legacy(solana_message::Message::new(
+                &[transfer],
+                Some(&payer.pubkey()),
+            )),
+        };
+        assert!(!svm.transaction_uses_durable_nonce(&plain));
+    }
+
+    #[test]
     fn recent_blockhash_age_counts_back_from_the_tip() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         // One tick first: at initialization the chain tip's hash sits
@@ -5603,6 +5693,7 @@ mod tests {
             max_profiles: 17,
             log_bytes_limit: None,
             skip_blockhash_check: true,
+            skip_signature_verification: false,
         };
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
 
@@ -5637,6 +5728,7 @@ mod tests {
             max_profiles: 23,
             log_bytes_limit: None,
             skip_blockhash_check: false,
+            skip_signature_verification: false,
         };
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
         let epoch_info = EpochInfo {
