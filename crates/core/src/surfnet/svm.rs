@@ -977,8 +977,11 @@ impl SurfnetSvm {
     /// no-op for every other lifecycle state, mirroring
     /// [`Self::expire_admitted_transaction`].
     pub fn reject_admitted_transaction(&mut self, signature: &Signature) {
-        let _ = signature;
-        todo!()
+        let mut lifecycle =
+            TransactionLifecycle::from(self.transaction_lifecycle_state(signature));
+        if lifecycle.reject().is_ok() {
+            let _ = self.transactions.take(&signature.to_string());
+        }
     }
 
     /// The Expire edge: removes an admitted transaction's Received
@@ -1078,7 +1081,21 @@ impl SurfnetSvm {
             vec![spl_token_interface::native_mint::ID.to_string()],
         )?;
         let blocks_db = storage_backend.open_store("blocks")?;
-        let transactions_db = storage_backend.open_store("transactions")?;
+        let mut transactions_db: Box<dyn Storage<String, SurfnetTransactionStatus>> =
+            storage_backend.open_store("transactions")?;
+        // A Received row from a previous process has no machine behind
+        // it: its command-queue entry died with that process. Sweep at
+        // open so the signature reads Unknown rather than as admitted
+        // forever.
+        let stale_admissions: Vec<String> = transactions_db
+            .into_iter()?
+            .filter_map(|(key, entry)| {
+                matches!(entry, SurfnetTransactionStatus::Received).then_some(key)
+            })
+            .collect();
+        for key in stale_admissions {
+            let _ = transactions_db.take(&key);
+        }
         let jito_bundles_db = storage_backend.open_store("jito_bundles")?;
         let token_accounts_db = storage_backend.open_store("token_accounts")?;
         let mut token_mints_db: Box<dyn Storage<String, MintAccount>> =

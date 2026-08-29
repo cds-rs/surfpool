@@ -1764,6 +1764,14 @@ impl SurfnetSvmLocker {
                     let _ =
                         status_tx.try_send(TransactionStatusEvent::VerificationFailure(err_str));
                 }
+                // A pre-execution failure on an admitted transaction is
+                // the lifecycle's Reject edge: the Received image is
+                // removed, so the signature reads as a real node's
+                // never-landed submission rather than as in flight
+                // forever.
+                self.with_svm_writer(|svm_writer| {
+                    svm_writer.reject_admitted_transaction(&signature)
+                });
                 return Err(e);
             }
         };

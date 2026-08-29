@@ -1904,6 +1904,13 @@ impl Full for SurfpoolFullRpc {
                     blockhash_validation,
                 }))
                 .map_err(|_| {
+                    // The admission committed but the runloop is gone;
+                    // unwind the Received image so a resend is not
+                    // answered Ok forever for a transaction that will
+                    // never execute.
+                    svm_locker.with_svm_writer(|svm_writer| {
+                        svm_writer.reject_admitted_transaction(&signature)
+                    });
                     Error::from(RpcCustomError::NodeUnhealthy {
                         num_slots_behind: None,
                     })
