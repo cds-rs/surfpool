@@ -161,8 +161,7 @@ pub struct TransactionLifecycle {
 /// through [`TransactionLifecycle::apply`].
 impl From<TransactionLifecycleState> for TransactionLifecycle {
     fn from(state: TransactionLifecycleState) -> Self {
-        let _ = state;
-        todo!()
+        Self { state }
     }
 }
 

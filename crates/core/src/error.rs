@@ -429,6 +429,14 @@ impl SurfpoolError {
         Self(error)
     }
 
+    /// A registry write the transaction lifecycle machine refused: the
+    /// signature is already past the transition the writer attempted.
+    pub fn transaction_lifecycle<K: std::fmt::Debug>(signature: Signature, refusal: K) -> Self {
+        let mut error = Error::internal_error();
+        error.message = format!("transaction {signature} refused by the lifecycle: {refusal:?}");
+        Self(error)
+    }
+
     pub fn sig_verify_replace_recent_blockhash_collision() -> Self {
         Self(Error::invalid_params(
             "sigVerify may not be used with replaceRecentBlockhash",

@@ -63,7 +63,7 @@ use surfpool_types::{
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
-    transaction_lifecycle::TransactionLifecycleState,
+    transaction_lifecycle::{TransactionLifecycle, TransactionLifecycleState},
     types::{
         ComputeUnitsEstimationResult, KeyedProfileResult, UiKeyedProfileResult, UuidOrSignature,
     },
@@ -870,8 +870,12 @@ impl SurfnetSvm {
     /// The lifecycle machine's answer for a signature, read from the
     /// registry: a missing entry is `Unknown`.
     pub fn transaction_lifecycle_state(&self, signature: &Signature) -> TransactionLifecycleState {
-        let _ = signature;
-        todo!()
+        self.transactions
+            .get(&signature.to_string())
+            .ok()
+            .flatten()
+            .map(|entry| entry.lifecycle_state())
+            .unwrap_or(TransactionLifecycleState::Unknown)
     }
 
     /// The single gate onto the registry's processed state. Applies
@@ -882,8 +886,43 @@ impl SurfnetSvm {
     /// stores the entry, queues it for confirmation, and notifies
     /// signature and logs subscribers at processed commitment.
     pub fn commit_processed_transaction(&mut self, commit: TransactionCommit) -> SurfpoolResult<()> {
-        let _ = commit;
-        todo!()
+        let TransactionCommit {
+            meta,
+            mutated_account_pubkeys,
+            status_tx,
+            notified_slot,
+        } = commit;
+        let signature = meta.transaction.signatures[0];
+
+        let mut lifecycle =
+            TransactionLifecycle::from(self.transaction_lifecycle_state(&signature));
+        if lifecycle.state() == TransactionLifecycleState::Unknown {
+            lifecycle
+                .admit()
+                .map_err(|refusal| SurfpoolError::transaction_lifecycle(signature, refusal.kind()))?;
+        }
+        lifecycle
+            .execute()
+            .map_err(|refusal| SurfpoolError::transaction_lifecycle(signature, refusal.kind()))?;
+
+        let err = meta.meta.status.clone().err();
+        let logs = meta.meta.log_messages.clone().unwrap_or_default();
+        let transaction = meta.transaction.clone();
+
+        self.transactions.store(
+            signature.to_string(),
+            SurfnetTransactionStatus::processed(meta, mutated_account_pubkeys),
+        )?;
+        self.transactions_queued_for_confirmation
+            .push_back((transaction, status_tx, err.clone()));
+        self.notify_signature_subscribers(
+            SignatureSubscriptionType::processed(),
+            &signature,
+            notified_slot,
+            err.clone(),
+        );
+        self.notify_logs_subscribers(&signature, err, logs, CommitmentLevel::Processed);
+        Ok(())
     }
 
     /// Creates a new instance of `SurfnetSvm`.

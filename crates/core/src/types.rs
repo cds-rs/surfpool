@@ -281,6 +281,23 @@ pub enum SurfnetTransactionStatus {
 }
 
 impl SurfnetTransactionStatus {
+    /// The registry entry's state in the lifecycle machine's
+    /// vocabulary: `Received` is the stored image of an admitted,
+    /// not yet executed transaction, and `Processed` is executed. A
+    /// missing entry is the machine's `Unknown`; that mapping lives
+    /// with the registry read, since an enum value cannot speak for
+    /// an absent one.
+    pub fn lifecycle_state(&self) -> surfpool_types::transaction_lifecycle::TransactionLifecycleState {
+        match self {
+            SurfnetTransactionStatus::Received => {
+                surfpool_types::transaction_lifecycle::TransactionLifecycleState::Admitted
+            }
+            SurfnetTransactionStatus::Processed(_) => {
+                surfpool_types::transaction_lifecycle::TransactionLifecycleState::Processed
+            }
+        }
+    }
+
     pub fn expect_processed(&self) -> &(TransactionWithStatusMeta, HashSet<Pubkey>) {
         match &self {
             SurfnetTransactionStatus::Received => unreachable!(),
