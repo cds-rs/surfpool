@@ -51,7 +51,7 @@ use crate::{
         CoupledAccount, FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GetTransactionResult,
         locker::SvmAccessContext, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
     },
-    types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
+    types::surfpool_tx_metadata_to_litesvm_tx_metadata,
 };
 
 const MAX_PRIORITIZATION_FEE_BLOCKS_CACHE: usize = 150;
@@ -2634,10 +2634,10 @@ impl Full for SurfpoolFullRpc {
 
             let mut prioritization_fees = vec![];
             for (slot, tx) in recent_transactions {
-                match tx {
-                    SurfnetTransactionStatus::Received => {}
-                    SurfnetTransactionStatus::Processed(data) => {
-                        let (status_meta, _) = data.as_ref();
+                match tx.as_processed() {
+                    None => {}
+                    Some((status_meta, _)) => {
+                        let status_meta = &status_meta;
                         let tx = &status_meta.transaction;
 
                         // If the transaction has an ALT and includes a compute budget instruction,
@@ -2767,7 +2767,7 @@ mod tests {
     use crate::{
         surfnet::{BlockHeader, BlockIdentifier, remote::SurfnetRemoteClient},
         tests::helpers::TestSetup,
-        types::{SyntheticBlockhash, TransactionWithStatusMeta},
+        types::{SurfnetTransactionStatus, SyntheticBlockhash, TransactionWithStatusMeta},
     };
 
     fn build_v0_transaction(

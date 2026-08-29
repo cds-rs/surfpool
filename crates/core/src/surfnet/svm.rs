@@ -62,7 +62,7 @@ use surfpool_types::{
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
-    transaction_lifecycle::{TransactionLifecycle, TransactionLifecycleState},
+    transaction_lifecycle::{TransactionLifecycle, TransactionLifecycleState, TransactionTransition},
     types::{
         ComputeUnitsEstimationResult, KeyedProfileResult, UiKeyedProfileResult, UuidOrSignature,
     },
@@ -842,14 +842,19 @@ impl SurfnetSvm {
         //    Use the now-committed `self.transactions` storage as the source of err/logs.
         let slot = self.get_latest_absolute_slot();
         for sig in &signatures {
-            let (err, logs) = match self.transactions.get(&sig.to_string()).ok().flatten() {
-                Some(SurfnetTransactionStatus::Processed(boxed)) => {
-                    let (meta, _mutated) = boxed.as_ref();
-                    let err = meta.meta.status.clone().err();
-                    let logs = meta.meta.log_messages.clone().unwrap_or_default();
+            let (err, logs) = match self
+                .transactions
+                .get(&sig.to_string())
+                .ok()
+                .flatten()
+                .and_then(|entry| entry.as_processed())
+            {
+                Some((meta, _mutated)) => {
+                    let err = meta.meta.status.err();
+                    let logs = meta.meta.log_messages.unwrap_or_default();
                     (err, logs)
                 }
-                _ => (None, Vec::new()),
+                None => (None, Vec::new()),
             };
             self.notify_signature_subscribers(
                 SignatureSubscriptionType::processed(),
@@ -921,6 +926,35 @@ impl SurfnetSvm {
             err.clone(),
         );
         self.notify_logs_subscribers(&signature, err, logs, CommitmentLevel::Processed);
+        Ok(())
+    }
+
+    /// The commitment gate: advances an executed entry's lifecycle in
+    /// the registry. The machine decides legality; on acceptance the
+    /// entry is rewritten under the advanced state with its payload
+    /// untouched.
+    pub fn advance_transaction_commitment(
+        &mut self,
+        signature: &Signature,
+        transition: TransactionTransition,
+    ) -> SurfpoolResult<()> {
+        let mut lifecycle =
+            TransactionLifecycle::from(self.transaction_lifecycle_state(signature));
+        lifecycle
+            .apply(transition)
+            .map_err(|refusal| SurfpoolError::transaction_lifecycle(*signature, refusal.kind()))?;
+        // The machine has already refused every state without an
+        // executed payload, so a missing entry here means the registry
+        // changed under us between the read and this get.
+        let payload = self
+            .transactions
+            .get(&signature.to_string())?
+            .and_then(|entry| entry.as_processed())
+            .ok_or_else(|| SurfpoolError::transaction_not_found(*signature))?;
+        self.transactions.store(
+            signature.to_string(),
+            SurfnetTransactionStatus::executed_at(lifecycle.state(), payload),
+        )?;
         Ok(())
     }
 
@@ -1663,9 +1697,14 @@ impl SurfnetSvm {
             });
         }
 
+        // Duplicate rejection keys on the lifecycle, so it holds at
+        // every commitment level; an expired or rejected signature has
+        // no executed entry and may be resubmitted.
         if matches!(
-            self.transactions.get(&signature.to_string()),
-            Ok(Some(SurfnetTransactionStatus::Processed(_)))
+            self.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Processed
+                | TransactionLifecycleState::Confirmed
+                | TransactionLifecycleState::Finalized
         ) {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::AlreadyProcessed,
@@ -2239,10 +2278,22 @@ impl SurfnetSvm {
             if error.is_some() {
                 num_failed = num_failed.saturating_add(1);
             }
+            let signature = tx.signatures[0];
+            // Advance the registry first, so the durable state leads
+            // the notifications below. A ghost entry (evicted, or a
+            // store that failed) keeps the legacy ladder: it still
+            // notifies and rides on, with the anomaly logged instead
+            // of silent.
+            if let Err(refusal) =
+                self.advance_transaction_commitment(&signature, TransactionTransition::Confirm)
+            {
+                self.simnet_events_tx.debug(format!(
+                    "confirmation of an entry the registry cannot advance: {refusal}"
+                ));
+            }
             let _ = status_tx.try_send(TransactionStatusEvent::Success(
                 TransactionConfirmationStatus::Confirmed,
             ));
-            let signature = tx.signatures[0];
             let finalized_at = self.latest_epoch_info.absolute_slot + FINALIZATION_SLOT_THRESHOLD;
             self.transactions_queued_for_finalization.push_back((
                 finalized_at,
@@ -2258,12 +2309,16 @@ impl SurfnetSvm {
                 error,
             );
 
-            let Some(SurfnetTransactionStatus::Processed(tx_data)) =
-                self.transactions.get(&signature.to_string()).ok().flatten()
+            let Some(tx_data) = self
+                .transactions
+                .get(&signature.to_string())
+                .ok()
+                .flatten()
+                .and_then(|entry| entry.as_processed())
             else {
                 continue;
             };
-            let (tx_with_status_meta, mutated_account_keys) = tx_data.as_ref();
+            let (tx_with_status_meta, mutated_account_keys) = &tx_data;
 
             for pubkey in mutated_account_keys {
                 self.account_update_slots.insert(*pubkey, current_slot);
@@ -2296,22 +2351,33 @@ impl SurfnetSvm {
             self.transactions_queued_for_finalization.pop_front()
         {
             if current_slot >= finalized_at {
+                let signature = &tx.signatures[0];
+                if let Err(refusal) =
+                    self.advance_transaction_commitment(signature, TransactionTransition::Finalize)
+                {
+                    self.simnet_events_tx.debug(format!(
+                        "finalization of an entry the registry cannot advance: {refusal}"
+                    ));
+                }
                 let _ = status_tx.try_send(TransactionStatusEvent::Success(
                     TransactionConfirmationStatus::Finalized,
                 ));
-                let signature = &tx.signatures[0];
                 self.notify_signature_subscribers(
                     SignatureSubscriptionType::finalized(),
                     signature,
                     self.latest_epoch_info.absolute_slot,
                     error,
                 );
-                let Some(SurfnetTransactionStatus::Processed(tx_data)) =
-                    self.transactions.get(&signature.to_string()).ok().flatten()
+                let Some(tx_data) = self
+                    .transactions
+                    .get(&signature.to_string())
+                    .ok()
+                    .flatten()
+                    .and_then(|entry| entry.as_processed())
                 else {
                     continue;
                 };
-                let (tx_with_status_meta, _) = tx_data.as_ref();
+                let (tx_with_status_meta, _) = &tx_data;
                 let logs = tx_with_status_meta
                     .meta
                     .log_messages
@@ -3089,10 +3155,12 @@ impl SurfnetSvm {
         subscription_type: SignatureSubscriptionType,
     ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
         let current_slot = self.get_latest_absolute_slot();
-        if let Some(SurfnetTransactionStatus::Processed(transaction)) =
-            self.transactions.get(&signature.to_string())?
+        if let Some((transaction, _)) = self
+            .transactions
+            .get(&signature.to_string())?
+            .and_then(|entry| entry.as_processed())
         {
-            let (transaction, _) = transaction.as_ref();
+            let transaction = &transaction;
             let confirmation_status =
                 if current_slot >= transaction.slot + FINALIZATION_SLOT_THRESHOLD {
                     RpcTransactionConfirmationStatus::Finalized
@@ -3642,10 +3710,14 @@ impl SurfnetSvm {
                 RpcTransactionLogsFilter::Mentions(mentioned_accounts) => {
                     // Get the tx accounts including loaded addresses
                     let transaction_accounts =
-                        if let Some(SurfnetTransactionStatus::Processed(tx_data)) =
-                            self.transactions.get(&signature.to_string()).ok().flatten()
+                        if let Some((tx_meta, _)) = self
+                            .transactions
+                            .get(&signature.to_string())
+                            .ok()
+                            .flatten()
+                            .and_then(|entry| entry.as_processed())
                         {
-                            let (tx_meta, _) = tx_data.as_ref();
+                            let tx_meta = &tx_meta;
                             let mut accounts =
                                 tx_meta.transaction.message.static_account_keys().to_vec();
 

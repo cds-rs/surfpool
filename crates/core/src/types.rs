@@ -58,6 +58,7 @@ use spl_token_2022_interface::{
         },
     },
 };
+use surfpool_types::transaction_lifecycle::TransactionLifecycleState;
 use surfpool_types::types::{
     ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, DeriveConfidentialKeysResponse,
     GetConfidentialBalanceResponse,
@@ -274,46 +275,81 @@ struct SerializableTransactionWithStatusMeta {
     pub meta: SerializableTransactionStatusMeta,
 }
 
+/// The registry's stored image of one transaction. The variant is the
+/// transaction's lifecycle state; the executed variants all carry the
+/// same payload, since commitment progression changes what the network
+/// promises about an execution, never the execution itself.
+///
+/// Match on this enum only to construct it; readers go through
+/// [`Self::as_processed`] / [`Self::expect_processed`], because a
+/// direct `Processed(_)` match silently stops seeing an entry the
+/// moment it confirms.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SurfnetTransactionStatus {
     Received,
     Processed(Box<(TransactionWithStatusMeta, HashSet<Pubkey>)>),
+    Confirmed(Box<(TransactionWithStatusMeta, HashSet<Pubkey>)>),
+    Finalized(Box<(TransactionWithStatusMeta, HashSet<Pubkey>)>),
 }
 
 impl SurfnetTransactionStatus {
     /// The registry entry's state in the lifecycle machine's
     /// vocabulary: `Received` is the stored image of an admitted,
-    /// not yet executed transaction, and `Processed` is executed. A
-    /// missing entry is the machine's `Unknown`; that mapping lives
-    /// with the registry read, since an enum value cannot speak for
-    /// an absent one.
-    pub fn lifecycle_state(&self) -> surfpool_types::transaction_lifecycle::TransactionLifecycleState {
+    /// not yet executed transaction; the other variants name their
+    /// states. A missing entry is the machine's `Unknown`; that
+    /// mapping lives with the registry read, since an enum value
+    /// cannot speak for an absent one.
+    pub fn lifecycle_state(&self) -> TransactionLifecycleState {
         match self {
-            SurfnetTransactionStatus::Received => {
-                surfpool_types::transaction_lifecycle::TransactionLifecycleState::Admitted
-            }
-            SurfnetTransactionStatus::Processed(_) => {
-                surfpool_types::transaction_lifecycle::TransactionLifecycleState::Processed
-            }
+            SurfnetTransactionStatus::Received => TransactionLifecycleState::Admitted,
+            SurfnetTransactionStatus::Processed(_) => TransactionLifecycleState::Processed,
+            SurfnetTransactionStatus::Confirmed(_) => TransactionLifecycleState::Confirmed,
+            SurfnetTransactionStatus::Finalized(_) => TransactionLifecycleState::Finalized,
         }
     }
 
+    /// The executed payload, at processed commitment or beyond: a real
+    /// node's commitment levels are cumulative, so confirmed and
+    /// finalized entries answer "processed" questions too.
     pub fn expect_processed(&self) -> &(TransactionWithStatusMeta, HashSet<Pubkey>) {
         match &self {
             SurfnetTransactionStatus::Received => unreachable!(),
-            SurfnetTransactionStatus::Processed(data) => data,
+            SurfnetTransactionStatus::Processed(data)
+            | SurfnetTransactionStatus::Confirmed(data)
+            | SurfnetTransactionStatus::Finalized(data) => data,
         }
     }
 
+    /// The executed payload, at processed commitment or beyond; `None`
+    /// for an entry that has not executed.
     pub fn as_processed(self) -> Option<(TransactionWithStatusMeta, HashSet<Pubkey>)> {
         match self {
             SurfnetTransactionStatus::Received => None,
-            SurfnetTransactionStatus::Processed(data) => Some(*data),
+            SurfnetTransactionStatus::Processed(data)
+            | SurfnetTransactionStatus::Confirmed(data)
+            | SurfnetTransactionStatus::Finalized(data) => Some(*data),
         }
     }
 
     pub fn processed(status: TransactionWithStatusMeta, updated_accounts: HashSet<Pubkey>) -> Self {
         Self::Processed(Box::new((status, updated_accounts)))
+    }
+
+    /// The stored image of an executed payload at the given lifecycle
+    /// state. Only the executed states have one; the commitment gate
+    /// hands this function machine output, so any other state is a
+    /// caller bug.
+    pub(crate) fn executed_at(
+        state: TransactionLifecycleState,
+        payload: (TransactionWithStatusMeta, HashSet<Pubkey>),
+    ) -> Self {
+        let payload = Box::new(payload);
+        match state {
+            TransactionLifecycleState::Processed => Self::Processed(payload),
+            TransactionLifecycleState::Confirmed => Self::Confirmed(payload),
+            TransactionLifecycleState::Finalized => Self::Finalized(payload),
+            other => unreachable!("{other:?} has no stored executed image"),
+        }
     }
 }
 
