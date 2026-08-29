@@ -3012,14 +3012,21 @@ mod tests {
             .collect::<Vec<_>>();
         let invalid = pks
             .map(|pk| {
-                Transaction::new_unsigned(LegacyMessage::new(
+                let mut tx = Transaction::new_unsigned(LegacyMessage::new(
                     &[system_instruction::transfer(
                         &pk,
                         &payer.pubkey(),
                         LAMPORTS_PER_SOL,
                     )],
                     Some(&payer.pubkey()),
-                ))
+                ));
+                // An unsigned transaction carries the all-zeros default
+                // signature, so ten of them would share one registry key
+                // and the lifecycle gate would refuse the nine duplicate
+                // executions. Each invalid transaction gets its own
+                // signature so each gets its own status.
+                tx.signatures[0] = Signature::new_unique();
+                tx
             })
             .collect::<Vec<_>>();
         let txs = valid

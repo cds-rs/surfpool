@@ -23,7 +23,6 @@ use solana_account_decoder::{
     parse_account_data::{AccountAdditionalDataV3, ParsedAccount, SplTokenAdditionalDataV2},
 };
 use solana_client::{
-    rpc_client::SerializableTransaction,
     rpc_config::{RpcAccountInfoConfig, RpcBlockConfig, RpcTransactionLogsFilter},
     rpc_filter::RpcFilterType,
     rpc_response::{RpcKeyedAccount, RpcLogsResponse, RpcPerfSample},
@@ -1269,53 +1268,38 @@ impl SurfnetSvm {
                 )),
             };
 
-            self.transactions.store(
-                tx.get_signature().to_string(),
-                SurfnetTransactionStatus::processed(
-                    TransactionWithStatusMeta {
-                        slot,
-                        transaction: tx.clone(),
-                        meta: TransactionStatusMeta {
-                            status: Ok(()),
-                            fee: 5000,
-                            pre_balances: vec![
-                                airdrop_account_before.lamports,
-                                recipient_account_before.lamports,
-                                system_account_before.lamports,
-                            ],
-                            post_balances: vec![
-                                airdrop_account_after.lamports,
-                                recipient_account_after.lamports,
-                                system_account_after.lamports,
-                            ],
-                            inner_instructions: Some(vec![]),
-                            log_messages: Some(tx_result.logs.clone()),
-                            pre_token_balances: Some(vec![]),
-                            post_token_balances: Some(vec![]),
-                            rewards: Some(vec![]),
-                            loaded_addresses: LoadedAddresses::default(),
-                            return_data: Some(tx_result.return_data.clone()),
-                            compute_units_consumed: Some(tx_result.compute_units_consumed),
-                            cost_units: None,
-                        },
+            self.commit_processed_transaction(TransactionCommit {
+                meta: TransactionWithStatusMeta {
+                    slot,
+                    transaction: tx,
+                    meta: TransactionStatusMeta {
+                        status: Ok(()),
+                        fee: 5000,
+                        pre_balances: vec![
+                            airdrop_account_before.lamports,
+                            recipient_account_before.lamports,
+                            system_account_before.lamports,
+                        ],
+                        post_balances: vec![
+                            airdrop_account_after.lamports,
+                            recipient_account_after.lamports,
+                            system_account_after.lamports,
+                        ],
+                        inner_instructions: Some(vec![]),
+                        log_messages: Some(tx_result.logs.clone()),
+                        pre_token_balances: Some(vec![]),
+                        post_token_balances: Some(vec![]),
+                        rewards: Some(vec![]),
+                        loaded_addresses: LoadedAddresses::default(),
+                        return_data: Some(tx_result.return_data.clone()),
+                        compute_units_consumed: Some(tx_result.compute_units_consumed),
+                        cost_units: None,
                     },
-                    HashSet::from([*pubkey]),
-                ),
-            )?;
-            self.notify_signature_subscribers(
-                SignatureSubscriptionType::processed(),
-                tx.get_signature(),
-                slot,
-                None,
-            );
-            self.notify_logs_subscribers(
-                tx.get_signature(),
-                None,
-                tx_result.logs.clone(),
-                CommitmentLevel::Processed,
-            );
-            self.transactions_queued_for_confirmation
-                .push_back((tx, status_tx.clone(), None));
+                },
+                mutated_account_pubkeys: HashSet::from([*pubkey]),
+                status_tx: status_tx.clone(),
+                notified_slot: slot,
+            })?;
             if let Some(account) = self.get_account(pubkey)? {
                 self.set_account(pubkey, account)?;
             }

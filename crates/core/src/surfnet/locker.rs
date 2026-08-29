@@ -66,7 +66,8 @@ use uuid::Uuid;
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
     GeyserEvent, LocalSignatureStatusOrSubscription, SignatureSubscriptionType, SurfnetSvm,
-    remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    remote::SurfnetRemoteClient,
+    svm::{AccountUpdatePolicy, TransactionCommit},
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -83,8 +84,8 @@ use crate::{
     storage::StorageResult,
     surfnet::FINALIZATION_SLOT_THRESHOLD,
     types::{
-        GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
-        TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
+        GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, TimeTravelConfig,
+        TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
     },
 };
 
@@ -2183,7 +2184,6 @@ impl SurfnetSvmLocker {
         let cus = meta.compute_units_consumed;
         let log_messages = meta.logs.clone();
         let err_string = err.to_string();
-        let signature = meta.signature;
 
         let accounts_after = pubkeys_from_message
             .iter()
@@ -2248,13 +2248,12 @@ impl SurfnetSvmLocker {
                     token_programs,
                     loaded_addresses.clone().unwrap_or_default(),
                 );
-                svm_writer.transactions.store(
-                    signature.to_string(),
-                    SurfnetTransactionStatus::processed(
-                        transaction_with_status_meta.clone(),
-                        HashSet::new(),
-                    ),
-                )?;
+                svm_writer.commit_processed_transaction(TransactionCommit {
+                    meta: transaction_with_status_meta.clone(),
+                    mutated_account_pubkeys: HashSet::new(),
+                    status_tx: status_tx.clone(),
+                    notified_slot: simulated_slot,
+                })?;
 
                 let _ = svm_writer
                     .geyser_events_tx
@@ -2263,24 +2262,6 @@ impl SurfnetSvmLocker {
                         Some(transaction.clone()),
                     ));
 
-                svm_writer.transactions_queued_for_confirmation.push_back((
-                    transaction.clone(),
-                    status_tx.clone(),
-                    Some(err.clone()),
-                ));
-
-                svm_writer.notify_signature_subscribers(
-                    SignatureSubscriptionType::processed(),
-                    &signature,
-                    simulated_slot,
-                    Some(err.clone()),
-                );
-                svm_writer.notify_logs_subscribers(
-                    &signature,
-                    Some(err.clone()),
-                    log_messages.clone(),
-                    CommitmentLevel::Processed,
-                );
                 svm_writer
                     .simnet_events_tx
                     .transaction_processed(meta_canonical, Some(err));
@@ -2438,13 +2419,12 @@ impl SurfnetSvmLocker {
                     &post_token_program_ids,
                     loaded_addresses.clone().unwrap_or_default(),
                 );
-                svm_writer.transactions.store(
-                    transaction_meta.signature.to_string(),
-                    SurfnetTransactionStatus::processed(
-                        transaction_with_status_meta.clone(),
-                        mutated_account_pubkeys,
-                    ),
-                )?;
+                svm_writer.commit_processed_transaction(TransactionCommit {
+                    meta: transaction_with_status_meta.clone(),
+                    mutated_account_pubkeys,
+                    status_tx: status_tx.clone(),
+                    notified_slot: simulated_slot,
+                })?;
 
                 svm_writer
                     .simnet_events_tx
@@ -2457,24 +2437,6 @@ impl SurfnetSvmLocker {
                         versioned_transaction,
                     ));
 
-                svm_writer.transactions_queued_for_confirmation.push_back((
-                    transaction.clone(),
-                    status_tx.clone(),
-                    None,
-                ));
-
-                svm_writer.notify_signature_subscribers(
-                    SignatureSubscriptionType::processed(),
-                    &signature,
-                    simulated_slot,
-                    None,
-                );
-                svm_writer.notify_logs_subscribers(
-                    &signature,
-                    None,
-                    logs.clone(),
-                    CommitmentLevel::Processed,
-                );
                 let _ = status_tx.try_send(TransactionStatusEvent::Success(
                     TransactionConfirmationStatus::Processed,
                 ));
@@ -4576,6 +4538,7 @@ mod tests {
     use crate::{
         rpc::full::RpcTransactionsForAddressFilters,
         scenarios::registry::PYTH_V2_IDL_CONTENT,
+        types::SurfnetTransactionStatus,
         surfnet::{
             BlockHeader, SurfnetSvm,
             svm::{SurfnetSvmConfig, apply_override_to_decoded_account},
