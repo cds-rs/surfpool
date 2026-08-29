@@ -513,13 +513,18 @@ pub async fn start_block_production_runloop(
                        }
                     }
                     SimnetCommand::Terminate(_) => {
-                        // Explicitly shutdown storage to trigger WAL checkpoint before exiting
-                        svm_locker.shutdown();
-                        // Close RPC servers on a separate thread to avoid dropping
-                        // Tokio runtimes from within an async context
+                        // Unwind in reverse creation order: stop serving
+                        // requests first, then shut storage down (the WAL
+                        // checkpoint removes the -wal/-shm sidecars, which
+                        // must not happen under a worker still querying the
+                        // pool). The RPC close runs on its own thread
+                        // because dropping Tokio runtimes from within an
+                        // async context aborts; the join is what keeps the
+                        // ordering.
                         if let Some(shutdown_fn) = shutdown_rpc_servers.take() {
-                            std::thread::spawn(shutdown_fn);
+                            let _ = std::thread::spawn(shutdown_fn).join();
                         }
+                        svm_locker.shutdown();
                         break;
                     }
                     SimnetCommand::SealStartupPlan(tasks, response_tx) => {
