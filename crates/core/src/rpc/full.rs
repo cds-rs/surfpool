@@ -34,7 +34,7 @@ use solana_transaction_status::{
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
     UiTransactionEncoding,
 };
-use surfpool_types::{SimnetCommand, TransactionStatusEvent};
+use surfpool_types::{ProcessTransactionRequest, SimnetCommand, TransactionStatusEvent};
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
@@ -1749,13 +1749,13 @@ impl Full for SurfpoolFullRpc {
 
         let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
         ctx.simnet_commands_tx
-            .send(SimnetCommand::ProcessTransaction(
-                ctx.id,
-                unsanitized_tx,
-                status_update_tx,
-                config.base.skip_preflight,
-                config.skip_sig_verify,
-            ))
+            .send(SimnetCommand::ProcessTransaction(ProcessTransactionRequest {
+                id: ctx.id,
+                transaction: unsanitized_tx,
+                status_tx: status_update_tx,
+                skip_preflight: config.base.skip_preflight,
+                skip_sig_verify: config.skip_sig_verify,
+            }))
             .map_err(|_| RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
             })?;
@@ -2831,7 +2831,8 @@ mod tests {
             .unwrap();
         loop {
             match mempool_rx.recv() {
-                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                Ok(SimnetCommand::ProcessTransaction(request)) => {
+                    let (tx, status_tx) = (request.transaction, request.status_tx);
                     let mut writer = setup.context.svm_locker.0.write().await;
                     let slot = writer.get_latest_absolute_slot();
                     writer.transactions_queued_for_confirmation.push_back((
@@ -5112,7 +5113,8 @@ mod tests {
 
             loop {
                 match mempool_rx.recv() {
-                    Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                    Ok(SimnetCommand::ProcessTransaction(request)) => {
+                        let (tx, status_tx) = (request.transaction, request.status_tx);
                         let mut writer = setup.context.svm_locker.0.write().await;
                         let slot = writer.get_latest_absolute_slot();
                         writer.transactions_queued_for_confirmation.push_back((

@@ -749,6 +749,23 @@ pub enum TransactionStatusEvent {
     VerificationFailure(String),
 }
 
+/// One transaction submission on its way to the execution engine: the
+/// transaction, the per-submission status channel, and the admission
+/// options the engine applies.
+#[derive(Debug)]
+pub struct ProcessTransactionRequest {
+    /// The submitting connection's identity, as the other simnet
+    /// commands carry it.
+    pub id: Option<(Hash, String)>,
+    pub transaction: VersionedTransaction,
+    pub status_tx: Sender<TransactionStatusEvent>,
+    /// Skips the preflight simulation before execution.
+    pub skip_preflight: bool,
+    /// Per-request override of the global signature verification
+    /// setting; `None` defers to the process-wide flag.
+    pub skip_sig_verify: Option<bool>,
+}
+
 #[derive(Debug)]
 pub enum SimnetCommand {
     SlotForward(Option<Hash>),
@@ -763,13 +780,7 @@ pub enum SimnetCommand {
     /// `CompleteStartupTask(RemoteAccounts, ..)`, it runs against unhydrated
     /// state. The readiness gate exists so clients wait for `Ready` rather
     /// than race that window.
-    ProcessTransaction(
-        Option<(Hash, String)>,
-        VersionedTransaction,
-        Sender<TransactionStatusEvent>,
-        bool,
-        Option<bool>,
-    ),
+    ProcessTransaction(ProcessTransactionRequest),
     Terminate(Option<(Hash, String)>),
     /// Seals the startup plan. Once sealed, `Ready` is unreachable until
     /// every declared task completes successfully; an unsealed plan can

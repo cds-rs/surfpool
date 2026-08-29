@@ -1450,7 +1450,8 @@ mod tests {
                         continue;
                     };
                     match cmd {
-                        SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _) => {
+                        SimnetCommand::ProcessTransaction(request) => {
+                            let (tx, status_tx) = (request.transaction, request.status_tx);
                             observed_process_tx_clone.fetch_add(1, Ordering::SeqCst);
 
                             // Minimal bookkeeping (mirrors other bundle tests) + unblock the RPC.
