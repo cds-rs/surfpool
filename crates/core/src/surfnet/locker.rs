@@ -1199,13 +1199,14 @@ impl SurfnetSvmLocker {
         }
 
         let ctx = self.with_contextualized_svm_reader(move |svm_reader| {
-            let current_slot = svm_reader.get_latest_absolute_slot();
+
 
             let mut records: Vec<Record> = svm_reader
                 .transactions
                 .into_iter()
                 .map(|iter| {
                     iter.filter_map(|(sig, status)| {
+                        let wire_status = status.wire_confirmation_status();
                         let Some((tx_with_meta, _)) = status.as_processed() else {
                             return None;
                         };
@@ -1261,13 +1262,11 @@ impl SurfnetSvmLocker {
                             meta: tx_with_meta.meta.clone(),
                         });
 
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        // The wire commitment reads the stored
+                        // lifecycle; as_processed filtered admitted
+                        // entries, so an executed answer exists.
+                        let confirmation_status =
+                            wire_status.unwrap_or(SolanaTransactionConfirmationStatus::Processed);
 
                         Some(Record {
                             signature: sig,
@@ -1405,13 +1404,14 @@ impl SurfnetSvmLocker {
         let min_context_slot = config.and_then(|c| c.min_context_slot).unwrap_or_default();
 
         self.with_contextualized_svm_reader(move |svm_reader| {
-            let current_slot = svm_reader.get_latest_absolute_slot();
+
 
             let sigs: Vec<_> = svm_reader
                 .transactions
                 .into_iter()
                 .map(|iter| {
                     iter.filter_map(|(sig, status)| {
+                        let wire_status = status.wire_confirmation_status();
                         let Some((
                             TransactionWithStatusMeta {
                                 slot,
@@ -1436,14 +1436,11 @@ impl SurfnetSvmLocker {
                             return None;
                         }
 
-                        // Determine confirmation status
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        // The wire commitment reads the stored
+                        // lifecycle; as_processed filtered admitted
+                        // entries, so an executed answer exists.
+                        let confirmation_status =
+                            wire_status.unwrap_or(SolanaTransactionConfirmationStatus::Processed);
 
                         // Reconstruct the memo summary the same way a full Agave validator
                         // does, reusing its canonical extractor. `account_keys()` on the
@@ -1654,7 +1651,9 @@ impl SurfnetSvmLocker {
             };
 
             // An admitted, not yet executed entry answers as a real
-            // node's in-flight window does: null.
+            // node's in-flight window does: null. The wire commitment
+            // is read off the entry before the payload consumes it.
+            let confirmation_status = entry.wire_confirmation_status();
             let Some((transaction_with_status_meta, _)) = entry.as_processed() else {
                 return Ok(GetTransactionResult::None(*signature));
             };
@@ -1670,7 +1669,7 @@ impl SurfnetSvmLocker {
                 config.max_supported_transaction_version,
                 true,
             )?;
-            Ok(GetTransactionResult::found_transaction(
+            Ok(GetTransactionResult::found_transaction_at_commitment(
                 *signature,
                 EncodedConfirmedTransactionWithStatusMeta {
                     slot,
@@ -1679,6 +1678,7 @@ impl SurfnetSvmLocker {
                     transaction_index: None,
                 },
                 latest_absolute_slot,
+                confirmation_status,
             ))
         })
     }

@@ -406,6 +406,9 @@ pub enum GetTransactionResult {
 }
 
 impl GetTransactionResult {
+    /// Builds the found result for a remote transaction, whose
+    /// commitment has no local lifecycle to read: slot arithmetic
+    /// stands in for it.
     pub fn found_transaction(
         signature: Signature,
         tx: EncodedConfirmedTransactionWithStatusMeta,
@@ -413,21 +416,35 @@ impl GetTransactionResult {
     ) -> Self {
         let is_finalized = latest_absolute_slot >= tx.slot + FINALIZATION_SLOT_THRESHOLD;
         let is_confirmed = latest_absolute_slot >= tx.slot + 1;
-        let (confirmation_status, confirmations) = if is_finalized {
-            (
-                Some(solana_transaction_status::TransactionConfirmationStatus::Finalized),
-                None,
-            )
+        let confirmation_status = Some(if is_finalized {
+            solana_transaction_status::TransactionConfirmationStatus::Finalized
         } else if is_confirmed {
-            (
-                Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed),
-                Some((latest_absolute_slot - tx.slot) as usize),
-            )
+            solana_transaction_status::TransactionConfirmationStatus::Confirmed
         } else {
-            (
-                Some(solana_transaction_status::TransactionConfirmationStatus::Processed),
-                Some((latest_absolute_slot - tx.slot) as usize),
-            )
+            solana_transaction_status::TransactionConfirmationStatus::Processed
+        });
+        Self::found_transaction_at_commitment(
+            signature,
+            tx,
+            latest_absolute_slot,
+            confirmation_status,
+        )
+    }
+
+    /// Builds the found result for a locally executed transaction: the
+    /// wire commitment comes from the stored lifecycle (the caller
+    /// reads it off the registry entry, and the drains are what
+    /// advance it, never the clock). Only the confirmations count is
+    /// slot arithmetic, because it is a count rather than the status.
+    pub fn found_transaction_at_commitment(
+        signature: Signature,
+        tx: EncodedConfirmedTransactionWithStatusMeta,
+        latest_absolute_slot: u64,
+        confirmation_status: Option<solana_transaction_status::TransactionConfirmationStatus>,
+    ) -> Self {
+        let confirmations = match confirmation_status {
+            Some(solana_transaction_status::TransactionConfirmationStatus::Finalized) => None,
+            _ => Some(latest_absolute_slot.saturating_sub(tx.slot) as usize),
         };
         let status = TransactionStatus {
             slot: tx.slot,

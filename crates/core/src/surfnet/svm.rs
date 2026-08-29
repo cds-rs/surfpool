@@ -3265,29 +3265,35 @@ impl SurfnetSvm {
         signature: &Signature,
         subscription_type: SignatureSubscriptionType,
     ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
-        let current_slot = self.get_latest_absolute_slot();
-        if let Some((transaction, _)) = self
-            .transactions
-            .get(&signature.to_string())?
-            .and_then(|entry| entry.as_processed())
-        {
-            let transaction = &transaction;
-            let confirmation_status =
-                if current_slot >= transaction.slot + FINALIZATION_SLOT_THRESHOLD {
-                    RpcTransactionConfirmationStatus::Finalized
-                } else if current_slot > transaction.slot {
-                    RpcTransactionConfirmationStatus::Confirmed
-                } else {
+        if let Some(entry) = self.transactions.get(&signature.to_string())? {
+            // The wire commitment reads the stored lifecycle; the
+            // drains are what advance it, never the clock. An admitted
+            // entry has no answer yet and falls through to the
+            // subscription.
+            let confirmation_status = entry.wire_confirmation_status().map(|wire| match wire {
+                solana_transaction_status::TransactionConfirmationStatus::Processed => {
                     RpcTransactionConfirmationStatus::Processed
-                };
-
-            if subscription_type.is_satisfied_by(confirmation_status) {
-                return Ok(LocalSignatureStatusOrSubscription::Status(
-                    LocalSignatureStatus {
-                        slot: transaction.slot,
-                        err: transaction.meta.status.clone().err(),
-                    },
-                ));
+                }
+                solana_transaction_status::TransactionConfirmationStatus::Confirmed => {
+                    RpcTransactionConfirmationStatus::Confirmed
+                }
+                solana_transaction_status::TransactionConfirmationStatus::Finalized => {
+                    RpcTransactionConfirmationStatus::Finalized
+                }
+            });
+            let payload = entry.as_processed();
+            if let (Some(confirmation_status), Some((transaction, _))) =
+                (confirmation_status, payload)
+            {
+                let transaction = &transaction;
+                if subscription_type.is_satisfied_by(confirmation_status) {
+                    return Ok(LocalSignatureStatusOrSubscription::Status(
+                        LocalSignatureStatus {
+                            slot: transaction.slot,
+                            err: transaction.meta.status.clone().err(),
+                        },
+                    ));
+                }
             }
         }
 
