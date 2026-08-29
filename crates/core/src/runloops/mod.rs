@@ -679,11 +679,17 @@ pub fn start_clock_runloop(
                         let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
                     }
                 }
-                Err(_e) => {}
+                // Disconnection is the runloop dropping its command
+                // end: the clock's reason to exist is gone, so the
+                // thread ends instead of ticking into dead channels
+                // forever.
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
             sleep(Duration::from_millis(slot_time));
-            if enabled {
-                let _ = clock_event_tx.send(ClockEvent::Tick);
+            if enabled && clock_event_tx.send(ClockEvent::Tick).is_err() {
+                // The tick receiver is gone too; same signal.
+                break;
             }
         }
     });
