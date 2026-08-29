@@ -971,6 +971,16 @@ impl SurfnetSvm {
             })
     }
 
+    /// The Reject edge for an admitted transaction: removes the
+    /// Received image, because Rejected has no stored image (reported
+    /// to the submitter and to no one else, reads return null). A
+    /// no-op for every other lifecycle state, mirroring
+    /// [`Self::expire_admitted_transaction`].
+    pub fn reject_admitted_transaction(&mut self, signature: &Signature) {
+        let _ = signature;
+        todo!()
+    }
+
     /// The Expire edge: removes an admitted transaction's Received
     /// image; the signature never resolves. A no-op for every other
     /// lifecycle state, because expiry exists only between admission
@@ -4454,6 +4464,69 @@ mod tests {
             .unwrap();
         rx.try_recv()
             .expect("execution notifies the admitted-window subscriber");
+    }
+
+    #[test]
+    fn rejecting_an_admitted_transaction_removes_the_received_image() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let signature = Signature::new_unique();
+        svm.admit_transaction(&signature).unwrap();
+
+        svm.reject_admitted_transaction(&signature);
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Unknown
+        );
+
+        // A no-op everywhere else: an executed entry stays.
+        svm.commit_processed_transaction(lifecycle_test_commit(signature, 1))
+            .unwrap();
+        svm.reject_admitted_transaction(&signature);
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Processed
+        );
+    }
+
+    /// A Received row that survives a process restart has no machine
+    /// behind it: its command-queue entry died with the process, so a
+    /// reopened database sweeps it, and the signature reads as Unknown
+    /// rather than as admitted forever.
+    #[test]
+    fn a_reopened_database_sweeps_stale_admissions() {
+        let db_path = std::env::temp_dir().join(format!(
+            "stale-admissions-{}.sqlite",
+            Pubkey::new_unique()
+        ));
+        let db_url = db_path.to_str().unwrap().to_string();
+        let signature = Signature::new_unique();
+        let executed = Signature::new_unique();
+
+        {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(&db_url), SurfnetSvmConfig::default()).unwrap();
+            svm.admit_transaction(&signature).unwrap();
+            svm.commit_processed_transaction(lifecycle_test_commit(executed, 1))
+                .unwrap();
+        }
+
+        let (svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(&db_url), SurfnetSvmConfig::default()).unwrap();
+        assert_eq!(
+            svm.transaction_lifecycle_state(&signature),
+            TransactionLifecycleState::Unknown,
+            "a stale admission is swept at open"
+        );
+        assert_eq!(
+            svm.transaction_lifecycle_state(&executed),
+            TransactionLifecycleState::Processed,
+            "executed entries survive the sweep"
+        );
+
+        drop(svm);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_url));
+        let _ = std::fs::remove_file(format!("{}-shm", db_url));
     }
 
     #[test]

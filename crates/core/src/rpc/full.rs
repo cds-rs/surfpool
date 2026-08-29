@@ -3308,6 +3308,36 @@ mod tests {
             .expect("a skip_preflight submission is dispatched");
     }
 
+    /// The admission gate's unwinding: a dispatch that cannot reach
+    /// the runloop must not leave the transaction admitted, or every
+    /// resend would answer Ok for a transaction that will never
+    /// execute.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_failed_dispatch_unwinds_the_admission() {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded::<SimnetCommand>();
+        // A closed command channel: the runloop is gone.
+        drop(mempool_rx);
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let tx = funded_transfer(&setup, 1_000_000);
+        let signature = tx.signatures[0];
+
+        setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                encode_versioned_transaction(&tx),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            lifecycle_of(&setup, &signature),
+            TransactionLifecycleState::Unknown,
+            "a dispatch failure must unwind the Received image"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_nonce_transaction_validates_at_execution() {
         let (mempool_tx, seen_rx) = spawn_confirming_mempool();

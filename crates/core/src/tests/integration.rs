@@ -11143,6 +11143,57 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
 #[test_case(TestType::no_db(); "with no db")]
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_a_pre_execution_failure_rejects_the_admitted_entry(test_type: TestType) {
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    // A v0 transaction whose address lookup table does not exist, on
+    // an offline surfnet: address resolution fails before execution.
+    let payer = Keypair::new();
+    let missing_table = Pubkey::new_unique();
+    let message = solana_message::v0::Message {
+        header: solana_message::MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 0,
+        },
+        account_keys: vec![payer.pubkey()],
+        recent_blockhash: svm_locker.with_svm_reader(|svm| svm.latest_blockhash()),
+        instructions: vec![],
+        address_table_lookups: vec![solana_message::v0::MessageAddressTableLookup {
+            account_key: missing_table,
+            writable_indexes: vec![0],
+            readonly_indexes: vec![],
+        }],
+    };
+    let tx = VersionedTransaction {
+        signatures: vec![solana_signature::Signature::new_unique()],
+        message: VersionedMessage::V0(message),
+    };
+    let signature = tx.signatures[0];
+
+    svm_locker
+        .with_svm_writer(|svm| svm.admit_transaction(&signature))
+        .unwrap();
+
+    let (status_tx, _status_rx) = crossbeam_unbounded();
+    svm_locker
+        .process_transaction(&None, tx, status_tx, true, false)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        svm_locker.with_svm_reader(|svm| svm.transaction_lifecycle_state(&signature)),
+        TransactionLifecycleState::Unknown,
+        "a pre-execution failure takes the Reject edge and removes the admitted image"
+    );
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_stale_blockhash_at_execution_never_lands(test_type: TestType) {
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
